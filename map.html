@@ -168,11 +168,22 @@
         <!-- ═══ Право, под шапкой: лог ИИ ═══ -->
         <div id="aiLog" class="hidden fixed top-24 left-3 z-30 bg-slate-900/95 border border-slate-700 rounded-xl p-3 text-xs w-64 max-h-56 overflow-y-auto"></div>
 
+        <!-- ═══ Право, под сезоном: мини-карта биомов ═══ -->
+        <div id="biomeMapPanel" class="fixed top-28 right-3 z-30 bg-slate-900/95 border border-slate-700 rounded-lg p-2 pointer-events-auto">
+            <div class="flex items-center justify-between gap-2 mb-1">
+                <span class="text-[10px] text-slate-400">Биомный шум</span>
+                <button onclick="toggleBiomeMap()" class="text-slate-400 hover:text-white text-xs leading-none">✕</button>
+            </div>
+            <canvas id="biomeMapCanvas" width="220" height="140" class="rounded border border-slate-800 block"
+                    style="image-rendering: pixelated;"></canvas>
+        </div>
+
         <!-- ═══ Низ по центру-справа: слой карты + завершить ход ═══ -->
         <div class="fixed bottom-3 right-3 z-30 flex items-center gap-2 pointer-events-none">
             <select id="hudViewMode" onchange="game.setViewMode(this.value)"
                     class="bg-slate-900/95 border border-slate-700 text-xs rounded-lg px-2 py-2 pointer-events-auto">
-                <option value="terrain" selected>Рельеф + климат</option>
+                <option value="terrain" selected>Обзор (биомы)</option>
+                <option value="biomes">Биомный шум (отладка)</option>
                 <option value="political">Рельеф + фракции</option>
                 <option value="factions">Карта фракций</option>
                 <option value="gold">Золото</option>
@@ -182,6 +193,10 @@
                 <option value="culture">Культура</option>
                 
             </select>
+            <button onclick="toggleBiomeMap()"
+                    class="px-3 py-2 bg-slate-900/95 hover:bg-slate-800 border border-slate-700 text-xs rounded-lg pointer-events-auto">
+                Биомы
+            </button>
             <button id="endTurnBtn" onclick="endTurnClicked()"
                     class="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-bold text-sm rounded-xl shadow-lg pointer-events-auto transition transform active:scale-95">
                 Завершить ход
@@ -313,6 +328,22 @@
                 playerFactionId: 0,
             });
             initInfoPanel()
+            drawBiomeMap()
+        }
+
+        // Мини-карта биомного шума: отдельный канвас, рисуется из поля биомов.
+        function toggleBiomeMap() {
+            const panel = document.getElementById('biomeMapPanel');
+            panel.classList.toggle('hidden');
+        }
+        function drawBiomeMap() {
+            const canvas = document.getElementById('biomeMapCanvas');
+            const f = game?.mapGen?.biomeField;
+            if (!canvas || !f || !f.canvas) return;
+            const g = canvas.getContext('2d');
+            g.imageSmoothingEnabled = false;
+            g.clearRect(0, 0, canvas.width, canvas.height);
+            g.drawImage(f.canvas, 0, 0, canvas.width, canvas.height);
         }
 
         
@@ -334,6 +365,19 @@
             const biomeLabel = game.mapGen.elevationBandLabels[region.biome] || region.biome;
             const res = region.resources;
 
+            // Состав региона: доля каждого биома по площади (biomeMix).
+            const mix = region.biomeMix || {};
+            const mixEntries = Object.entries(mix).filter(([, f]) => f >= 0.01).sort((a, b) => b[1] - a[1]);
+            const mixBars = mixEntries.map(([id, f]) => {
+                const color = game.mapGen.biomeColorById[id] || '#888';
+                const label = game.mapGen.biomeLabelById[id] || id;
+                const pct = Math.round(f * 100);
+                return `<div class="flex items-center gap-1 text-[10px]" title="${label}">`
+                    + `<span style="background:${color}" class="inline-block w-2.5 h-2.5 rounded-sm border border-black/40"></span>`
+                    + `<span class="text-slate-300">${label}</span>`
+                    + `<span class="text-slate-500 ml-auto">${pct}%</span></div>`;
+            }).join('');
+
             const forecast = game.mapGen.getRegionResourcesForecast(mapRegion.region);
             const hasPendingChange = mapRegion.region.pendingSpecialization !== null && mapRegion.region.pendingSpecialization !== undefined;
             const effectiveSpec = mapRegion.region.pendingSpecialization ?? mapRegion.region.specialization;
@@ -341,6 +385,7 @@
             
             let html = `
                 <div class="font-semibold text-emerald-400 mb-1">${region.name} · ${biomeLabel}</div>
+                <div class="mb-2 flex flex-col gap-0.5">${mixBars}</div>
                 <div>Еда ${res.food.toFixed(1)} · Произв. ${res.production.toFixed(1)}</div> · Эфир. ${res.ether.toFixed(1)}</div>
                 <div>Золото ${res.gold.toFixed(1)} · Содержание ${res.upkeep.toFixed(1)}</div>
                 ${hasPendingChange ? `<div class="text-amber-400 text-[10px] mt-1">След. ход: 🌾${forecast.food.toFixed(1)} ⚙️${forecast.production.toFixed(1)} 'Э'${forecast.ether.toFixed(1)} 🪙${forecast.gold.toFixed(1)}</div>` : ''}

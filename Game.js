@@ -128,9 +128,9 @@ class Game {
         });
         const playerFaction = this.factionsManager.getPlayer();
         if (playerFaction) {
-            this.mapGen.focusOnRegion(playerFaction.capitalRegionId);
             this.mapGen.setPlayerFaction(playerFaction.id);
         }
+        this.mapGen.resetView();   // overview: показываем всю карту целиком
         const economies = this.mapGen.getAllFactionEconomies();
         this.turnManager._applyEconomies(economies);
         if (this.callbacks.onGameReady) this.callbacks.onGameReady(this.state);
@@ -230,13 +230,13 @@ class Game {
     // ── Дипломатия — тонкий проброс, чтобы UI не трогал diplomacyManager напрямую ──
     declareWar(a, b) {
         const result = this.diplomacyManager?.declareWar(a, b) ?? false;
-        if (result) { this.mapGen.markDirty('political'); this.mapGen.render(); }
+        if (result) { this.mapGen._staticDirty = true; this.mapGen.render(); }
         return result;
     }
 
     makePeace(a, b) {
         const result = this.diplomacyManager?.makePeace(a, b) ?? false;
-        if (result) { this.mapGen.markDirty('political'); this.mapGen.render(); }
+        if (result) { this.mapGen._staticDirty = true; this.mapGen.render(); }
         return result;
     }
     formAlliance(a, b) { return this.diplomacyManager?.formAlliance(a, b) ?? false; }
@@ -256,7 +256,7 @@ class Game {
     
     proposeAlliance(a, b) {
         const result = this.diplomacyManager?.formAlliance(a, b) ?? false;
-        if (result) { this.mapGen.markDirty('political'); this.mapGen.render(); }
+        if (result) { this.mapGen._staticDirty = true; this.mapGen.render(); }
         return result;
     }
 

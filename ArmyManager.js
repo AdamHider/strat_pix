@@ -236,7 +236,7 @@ class ArmyManager {
         });
 
         if (capturedRegions.length) {
-            mapGen.markDirty('terrain', 'political', 'fog');
+            mapGen._staticDirty = true;
         }
         this.game.mapGen._invalidateVisibilityCache();
         this.game.mapGen._invalidateAdjacencyCache();
