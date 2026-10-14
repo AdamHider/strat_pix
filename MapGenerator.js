@@ -4,10 +4,9 @@ class MapGenerator {
         this.height = options.height || 600;
         this.borderMargin = options.borderMargin || 22;
         this.biomeCellSize = options.biomeCell ?? 6;
-        // Размер «пикселя» ландшафта в мировых единицах и радиус смягчения
-        // береговой линии. Меньше pixel → мельче зерно карты.
-        this.landscapePixelSize = options.landscapePixel ?? 2;
-        this.landscapeFeather = options.landscapeFeather ?? 1;
+        // Пикселей на клетку биомного поля в пиксельном ландшафте.
+        // Меньше tile → мельче зерно карты.
+        this.landscapeTileSize = options.landscapeTile ?? 6;
 
         this.showClimate = options.showClimate ?? true;
         this.currentSeason = options.currentSeason ?? 'SUMMER';
@@ -201,7 +200,6 @@ class MapGenerator {
             cellAt: MapBiomes.cellAt.bind(this),
             mixAt: MapBiomes.mixAt.bind(this),
             buildFieldCanvas: MapBiomes.buildFieldCanvas.bind(this),
-            buildLandCover: MapBiomes.buildLandCover.bind(this),
             paintField: MapBiomes.paintField.bind(this),
         };
         this.assets = new AssetManager({
@@ -209,7 +207,9 @@ class MapGenerator {
             onAnyLoaded: () => { this._staticDirty = true; this.scheduleRender(); },
         });
         this.decorations = {
-            enabled: options.iconsEnabled ?? true,
+            // Отключено: ландшафт рисует деревья/траву/камни сам (см.
+            // SECTION: MAP_LANDSCAPE). Иконки больше не используются.
+            enabled: false,
             ready: false,
             edgeMargin: options.iconEdgeMargin ?? 1.2,
             defaultSizePct: options.iconDefaultSizePct || [0.5, 0.6],
@@ -468,22 +468,14 @@ class MapGenerator {
             DEEP_OCEAN:   { keys: ['wave'],                      density: 1.0, sizePct: [0.5, 0.6] },
         };
         this.biomeField = { cell: this.biomeCellSize, w: 0, h: 0, dom: null, canvas: null,
-                            regionOf: null, water: null, landCover: null, blurTmp: null };
+                            regionOf: null, water: null };
 
         // ── Пиксельный ландшафт (dark fantasy pixel art) ─────────────
-        // Весь фон карты строится из биомного шума: каждый «пиксель»
-        // ландшафта — блок world-единиц (landscape.pixel). На границах
-        // биомов цвет дизерится/смешивается → плавный переход.
+        // Вся графика карты рисуется в один холст из биомного поля:
+        // см. SECTION: MAP_LANDSCAPE. Клетка поля = landscapeTile пикселей.
         this.landscape = {
-            pixel: this.landscapePixelSize,
-            feather: this.landscapeFeather,
             canvas: null,
-            w: 0,
-            h: 0,
             tintKey: null,
-        };
-        this.landscape = {
-            ...this.landscape,
             ...MapLandscape.data,
             ...Object.fromEntries(Object.entries(MapLandscape.methods).map(([k, f]) => [k, f.bind(this)])),
         };
@@ -897,8 +889,6 @@ class MapGenerator {
         // Биомное поле: растеризуем шум по регионам → biomeMix, доминирующий
         // биом, isWater, ресурсы и стоимость движения.
         this.biomes.buildField(regions, voronoi, isWater, t);
-        this.landscape.buildSoftBiome();
-        this.biomes.buildLandCover();
         this.biomes.assignRegions(regions);
 
         regions.forEach(region => {
@@ -957,6 +947,12 @@ class MapGenerator {
         this.regionNeighbors = neighbors;
         this.rivers.generate(regions, neighbors);
         this.riverProximityIndex = this.rivers.createProximityIndex();
+
+        // Пиксельный ландшафт рисуем последним: он использует и биомное
+        // поле, и русла рек. Кэш сбрасываем, чтобы гарантированно пересобрать.
+        this.landscape.canvas = null;
+        this.landscape.build();
+        this._staticDirty = true;
 
         this.viewTransform = { x: 0, y: 0, scale: 1 };
     }
@@ -1043,18 +1039,17 @@ class MapGenerator {
     _paintTerrainContent(ctx, rect = null) {
         // 1. Пиксельный биомный ландшафт — база всей графики карты.
         if (!this.terrain.usesFlatFill()) this.landscape.paint(ctx);
-        // 2. Регионы: плоская заливка (для режимов фракций/ресурсов) и/или
-        //    цвет владельца поверх ландшафта.
+        // 2. Регионы: цвет владельца поверх ландшафта (плоская заливка —
+        //    только в режимах фракций/ресурсов).
         this.terrain.regions.render(ctx, rect);
-        // 3. Реки и мосты. Береговую линию в обычном обзоре задаёт мягкая
-        //    маска суши в ландшафте; жёсткий полигонный контур нужен лишь
-        //    в режимах со сплошной заливкой регионов.
-        this.rivers.paint(ctx, rect);
-        this.rivers.paintBridges(ctx, rect);
-        if (this.terrain.usesFlatFill()) this.paintCoastline(ctx, rect);
-        // 4. Декор из биомной смеси: деревья/трава/камни по биомам.
-        this.decorations.paintTextures(ctx, rect);
-        this.pixelDecor.paint(ctx, rect, 0.4)
+        // 3. В обычном обзоре ландшафт рисует всё сам (берега, реки,
+        //    деревья, поля). В режимах со сплошной заливкой поверх неё
+        //    кладём реки, мосты и полигонный контур берега.
+        if (this.terrain.usesFlatFill()) {
+            this.rivers.paint(ctx, rect);
+            this.rivers.paintBridges(ctx, rect);
+            this.paintCoastline(ctx, rect);
+        }
     }
     paintCoastline(ctx, visibleRect) {
         if (!this.edgeMap) return;
@@ -1213,32 +1208,6 @@ const MapBiomes = {
         }
         return best;
     },
-    // Мягкая маска суши: бинарное «вода/суша» размывается в непрерывное
-    // поле 0..1. Нужна, чтобы береговая линия была плавной, а под пиксель-
-    // арт декором лежал мягкий градиент (а не ступенька по полигону).
-    _blurField(src, w, h, radius, passes, tmp) {
-        let a = src, b = tmp;
-        for (let p = 0; p < passes; p++) {
-            for (let j = 0; j < h; j++) {              // горизонтальный проход
-                const row = j * w;
-                for (let i = 0; i < w; i++) {
-                    let sum = 0, n = 0;
-                    const i0 = Math.max(0, i - radius), i1 = Math.min(w - 1, i + radius);
-                    for (let k = i0; k <= i1; k++) { sum += a[row + k]; n++; }
-                    b[row + i] = sum / n;
-                }
-            }
-            for (let i = 0; i < w; i++) {              // вертикальный проход
-                for (let j = 0; j < h; j++) {
-                    let sum = 0, n = 0;
-                    const j0 = Math.max(0, j - radius), j1 = Math.min(h - 1, j + radius);
-                    for (let k = j0; k <= j1; k++) { sum += b[k * w + i]; n++; }
-                    a[j * w + i] = sum / n;
-                }
-            }
-        }
-        return a;
-    },
     buildField(regions, voronoi, isWater, t) {
         const cell = this.biomeField.cell;
         const w = this.biomeField.w = Math.ceil(this.width / cell) + 1;
@@ -1359,18 +1328,6 @@ const MapBiomes = {
         const region = this.terrain.regions.all[f.regionOf[j * f.w + i]];
         return region ? region.biomeMix : null;
     },
-    // Непрерывная маска суши 0..1 (размытая вода) — база плавного берега.
-    buildLandCover() {
-        const f = this.biomeField;
-        if (!f.water) { f.landCover = null; return null; }
-        const n = f.w * f.h;
-        if (!f.blurTmp || f.blurTmp.length !== n) f.blurTmp = new Float32Array(n);
-        const land = new Float32Array(n);
-        for (let k = 0; k < n; k++) land[k] = f.water[k] ? 0 : 1;
-        const r = Math.max(1, Math.round(this.landscape.feather * 2));
-        f.landCover = MapBiomes._blurField(land, f.w, f.h, r, 2, f.blurTmp);
-        return f.landCover;
-    },
     buildFieldCanvas() {
         const f = this.biomeField;
         if (!f.dom) return null;
@@ -1398,205 +1355,800 @@ const MapBiomes = {
 
 // ═══════════════════════════════════════════════════════════
 // SECTION: MAP_LANDSCAPE
-// Пиксельный ландшафт — основная графика карты (dark fantasy pixel
-// art). Рисуется напрямую из биомного поля: каждый пиксель фона берёт
-// биом из шума, а на границах биомов дизерится между двумя палитрами,
-// поэтому переходы плавные, без ступенек по полигонам регионов.
-// Вода/суша разграничиваются мягкой маской landCover (плавный берег).
-// Готовый слой кэшируется и пересобирается только при смене сезона/вида.
+// Пиксельный ландшафт — основная (и единственная) графика карты.
+// Порт из reference-проекта square_reference: вся карта рисуется один
+// раз в скрытый холст, пиксель за пикселем.
+//
+// Слои (снизу вверх):
+//   1. фон — цвет клетки, дизеренный билинейно с соседями;
+//   2. светотень холмов (свет слева-сверху);
+//   3. берега (пляж/камни/утёс) и пена у воды;
+//   4. реки с мягкой кромкой и мокрым берегом;
+//   5. крапинки и пучки травы;
+//   6. горы — карта высот, наклонно спроецированная (север «выше»);
+//   7. деревья, поля, руда, разломы — снизу вверх, как в перспективе;
+//   8. границы регионов;
+//   9. тёмная цветокоррекция, туман, виньетка.
+//
+// Отдельного слоя декораций/иконок нет: ландшафт рисует всё сам.
+// Решётка — клетка биомного поля (biomeField) размером landscapeTile
+// пикселей. Холст кэшируется и пересобирается при смене сезона.
 // ═══════════════════════════════════════════════════════════
+
+/* ---------- Быстрые операции над packed-цветом (0xAABBGGRR) ---------- */
+const LS_PACK = (r, g, b) => (0xFF000000 | (b << 16) | (g << 8) | r);
+const LS_HEX = hex => LS_PACK(parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16));
+const LS_WHITE = LS_PACK(255, 255, 255);
+const LS_BLACK = LS_PACK(0, 0, 0);
+
+function lsMix(a, b, t) {
+    const w = Math.round(t * 256), inv = 256 - w;
+    const r = ((a & 255) * inv + (b & 255) * w) >> 8;
+    const g = (((a >>> 8) & 255) * inv + ((b >>> 8) & 255) * w) >> 8;
+    const bl = (((a >>> 16) & 255) * inv + ((b >>> 16) & 255) * w) >> 8;
+    return 0xFF000000 | (bl << 16) | (g << 8) | r;
+}
+function lsShade(color, amount) {
+    const r = color & 255, g = (color >>> 8) & 255, b = (color >>> 16) & 255;
+    if (amount < 0) {
+        const keep = 256 + amount;
+        return 0xFF000000 | (((b * keep) >> 8) << 16) | (((g * keep) >> 8) << 8) | ((r * keep) >> 8);
+    }
+    return 0xFF000000 | ((b + (((255 - b) * amount) >> 8)) << 16) | ((g + (((255 - g) * amount) >> 8)) << 8) | (r + (((255 - r) * amount) >> 8));
+}
+function lsSpeck(color, lighter) {
+    const target = lighter ? 255 : 0;
+    const r = (color & 255) + (((target - (color & 255)) * 33) >> 8);
+    const g = ((color >>> 8) & 255) + (((target - ((color >>> 8) & 255)) * 33) >> 8);
+    const b = ((color >>> 16) & 255) + (((target - ((color >>> 16) & 255)) * 33) >> 8);
+    return 0xFF000000 | (b << 16) | (g << 8) | r;
+}
+
+/* ---------- Детерминированный хеш: перемешиваем биты, иначе видны полосы ---------- */
+function lsHash(x, y, k) {
+    let h = (Math.imul(x | 0, 374761393) + Math.imul(y | 0, 668265263) + Math.imul(k | 0, 1274126177)) | 0;
+    h = Math.imul(h ^ (h >>> 13), 1103515245);
+    h ^= h >>> 16;
+    h = Math.imul(h, 2246822519);
+    h ^= h >>> 13;
+    return h >>> 0;
+}
+const lsUnit = (x, y, k) => lsHash(x, y, k) / 4294967296;
+const lsSmooth = t => t * t * (3 - 2 * t);
+
+// Матрица упорядоченного дизеринга 4×4 — «пиксельный» градиент вместо размытия.
+const LS_BAYER = Float32Array.from([0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5], v => (v + 0.5) / 16);
+const LS_SHADE_STEPS = [-30, -15, 0, 15, 28];
+
+// Плавный шум: решётка и позиции считаются один раз, затем выборка быстрая.
+class LsNoise {
+    constructor(width, cell, salt) {
+        const count = Math.ceil(width / cell) + 2;
+        this.count = count;
+        this.lattice = new Float32Array(count * count);
+        for (let y = 0; y < count; y++)
+            for (let x = 0; x < count; x++) this.lattice[y * count + x] = lsUnit(x, y, salt);
+        this.index = new Int32Array(width);
+        this.fraction = new Float32Array(width);
+        for (let p = 0; p < width; p++) {
+            const f = p / cell, i = Math.floor(f);
+            this.index[p] = i;
+            this.fraction[p] = lsSmooth(f - i);
+        }
+    }
+    at(gx, gy) {
+        const { lattice, count } = this;
+        const k = this.index[gy] * count + this.index[gx];
+        const u = this.fraction[gx], v = this.fraction[gy];
+        const top = lattice[k] + (lattice[k + 1] - lattice[k]) * u;
+        const bottom = lattice[k + count] + (lattice[k + count + 1] - lattice[k + count]) * u;
+        return top + (bottom - top) * v;
+    }
+}
+
 const MapLandscape = {
     data: {
-        // Палитры: 4 оттенка на биом (тёмный → светлый). Вода — глубокие
-        // сине-серые тона, лес — почти чёрно-зелёный, пики — камень.
+        // Пикселей на клетку биомного поля (options.landscapeTile).
+        tilePx: 6,
+        // Палитры биомов: 4 оттенка, тёмный → светлый (dark fantasy).
         palettes: {
-            DEEP_OCEAN:   ['#0d151d', '#101a24', '#132130', '#17283a'],
-            OCEAN:        ['#14222d', '#182a37', '#1d3342', '#233e4e'],
-            COAST:        ['#3c4b30', '#46573a', '#516444', '#5d714e'],
-            BEACH:        ['#7a6f4c', '#8d8058', '#a09266', '#b3a475'],
-            STEPPE:       ['#736d38', '#827b40', '#918949', '#a19752'],
-            PLAINS:       ['#4c6430', '#577137', '#637f3e', '#708d46'],
-            GRASSLAND:    ['#435c2b', '#4e6a31', '#5a7837', '#66863e'],
-            WETLANDS:     ['#2e4025', '#364a2c', '#3f5633', '#49623b'],
-            WOODLAND:     ['#2c4322', '#344d28', '#3d592e', '#476535'],
-            FOREST:       ['#1e3519', '#243f1e', '#2b4a24', '#33552b'],
-            DENSE_FOREST: ['#142512', '#192e16', '#1f371b', '#264120'],
-            HIGHLANDS:    ['#494941', '#535349', '#5e5e53', '#6a6a5e'],
-            PEAKS:        ['#4a4a50', '#56565d', '#63636b', '#71717a'],
+            COAST:        ['#4a5c3b', '#556a44', '#60754d', '#6b8156'],
+            BEACH:        ['#8a7f58', '#9d9065', '#b0a273', '#c2b482'],
+            STEPPE:       ['#837c40', '#928a48', '#a19851', '#b0a65a'],
+            PLAINS:       ['#5a7638', '#66833f', '#728f47', '#7e9b4f'],
+            GRASSLAND:    ['#516d32', '#5c7b38', '#67893e', '#729746'],
+            WETLANDS:     ['#384d2b', '#415833', '#4a643a', '#547042'],
+            WOODLAND:     ['#354f28', '#3d5a2e', '#466535', '#4f713c'],
+            FOREST:       ['#26401d', '#2d4a23', '#345529', '#3b6030'],
+            DENSE_FOREST: ['#1b2f16', '#21381b', '#284121', '#2f4b27'],
+            HIGHLANDS:    ['#55554b', '#5f5f54', '#6a6a5e', '#767669'],
+            PEAKS:        ['#55555b', '#616168', '#6e6e76', '#7b7b85'],
         },
-        // Тёплый/холодный сдвиг палитры по климату региона.
-        climateShift: {
-            cold:      { tint: '#b9d3e8', amt: 0.16 },
-            temperate: { tint: null, amt: 0 },
-            hot:       { tint: '#e8c07a', amt: 0.14 },
+        waterShades: ['#43768c', '#3a687c', '#325a6c', '#2a4c5b', '#223f4c'],
+        iceShades:   ['#c9dbe4', '#b6ccd8', '#a3bccb'],
+        snow: '#e9eef1', snowShade: '#c6d0d6', rock: '#5a5a58', trunk: '#3a2a1c',
+        broadleaf: ['#2f5a2c', '#42733a', '#4d7f3f'],
+        conifer:   ['#25452f', '#33593c'],
+        wheatStalk: '#b6a94a', wheatTop: '#e0d478',
+        colors: {
+            bridgeDeck: '#a39e92', bridgeEdge: '#6e6a62', stone: '#b9b5ab', stoneMid: '#8a877e',
+            gold: '#f2d15b', goldShadow: '#8a6a14', goldLight: '#fff2b0',
+            riftDark: '#2a1250', riftGlow: '#a45cff', riftCore: '#e9ccff',
+            sand: '#dccb96', wetSand: '#b5a67c', pebbleLight: '#a9a59a', pebbleDark: '#6f6c66',
+            regionBorder: '#19110a',
         },
-        // Фактура биома: пятна/крапины поверх базового тона, чтобы лес
-        // читался как кроны, луга — как трава, степь — как пшеница и т.д.
-        // clump/clumpP — крупные пятна, hi/lo — мелкая крапина.
-        features: {
-            COAST:        { clump: 3, clumpP: 0.25, clumpCol: '#2f4023', hi: '#6b8055', hiP: 0.22, lo: '#26361d', loP: 0.18 },
-            BEACH:        { clump: 4, clumpP: 0.20, clumpCol: '#8a7d56', hi: '#c8b98a', hiP: 0.28, lo: '#6a6040', loP: 0.16 },
-            STEPPE:       { clump: 3, clumpP: 0.22, clumpCol: '#5a542c', hi: '#b8ac6a', hiP: 0.30, lo: '#544e28', loP: 0.18 },
-            PLAINS:       { clump: 3, clumpP: 0.24, clumpCol: '#3a4d24', hi: '#7f9d52', hiP: 0.24, lo: '#334420', loP: 0.18 },
-            GRASSLAND:    { clump: 3, clumpP: 0.26, clumpCol: '#354820', hi: '#83a856', hiP: 0.26, lo: '#2e3f1c', loP: 0.18 },
-            WETLANDS:     { clump: 3, clumpP: 0.34, clumpCol: '#22301a', hi: '#48603a', hiP: 0.18, lo: '#1b2715', loP: 0.24 },
-            WOODLAND:     { clump: 2, clumpP: 0.34, clumpCol: '#1e2f16', hi: '#486836', hiP: 0.20, lo: '#162411', loP: 0.22 },
-            FOREST:       { clump: 2, clumpP: 0.42, clumpCol: '#0f2010', hi: '#38682c', hiP: 0.18, lo: '#0c190d', loP: 0.24 },
-            DENSE_FOREST: { clump: 2, clumpP: 0.50, clumpCol: '#0a140b', hi: '#2c5623', hiP: 0.14, lo: '#081009', loP: 0.26 },
-            HIGHLANDS:    { clump: 2, clumpP: 0.30, clumpCol: '#38382f', hi: '#7d7d70', hiP: 0.26, lo: '#31312a', loP: 0.22 },
-            PEAKS:        { clump: 2, clumpP: 0.28, clumpCol: '#35353a', hi: '#d8dce0', hiP: 0.20, lo: '#2d2d31', loP: 0.22 },
+        // Сезон: тон/свет/температура + стадия пшеницы и признаки (листва/цвет/снег).
+        seasons: {
+            SPRING: { tint: '#dff0c8', sat: 0.9, light: 1.05, tempShift: 0.02,  wheat: 0.55, blossom: true,  bare: false, snow: false },
+            SUMMER: { tint: '#f6efb0', sat: 1.0, light: 1.0,  tempShift: 0.08,  wheat: 0.85, blossom: false, bare: false, snow: false },
+            AUTUMN: { tint: '#e2a24a', sat: 0.9, light: 0.94, tempShift: -0.08, wheat: 1.0,  blossom: false, bare: false, snow: false },
+            WINTER: { tint: '#eaf3f7', sat: 0.7, light: 0.92, tempShift: -0.20, wheat: 0.2,  blossom: false, bare: true,  snow: true },
         },
+        iceTemp: 0.16, snowTemp: 0.30,
     },
 
     methods: {
-    _shift(hex, tint, amt) { return amt > 0 ? this.color.blend(hex, tint, amt) : hex; },
-    _hash(a, b) {
-        let h = (Math.imul(a + 1, 374761393) + Math.imul(b + 1, 668265263)) >>> 0;
-        h = Math.imul(h ^ (h >>> 13), 1274126177) >>> 0;
-        return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+    /* ---------- Палитра сезона ---------- */
+    _tone(hex, sat, light, tint) {
+        const n = parseInt(hex.slice(1), 16);
+        let r = (n >> 16) & 255, g = (n >> 8) & 255, b = n & 255;
+        const luma = 0.299 * r + 0.587 * g + 0.114 * b;
+        r = luma + (r - luma) * sat; g = luma + (g - luma) * sat; b = luma + (b - luma) * sat;
+        const t = LS_HEX(tint || '#ffffff');
+        const tr = t & 255, tg = (t >>> 8) & 255, tb = (t >>> 16) & 255;
+        const mixc = (v, tv) => Math.max(0, Math.min(255, Math.round(v * light * (0.55 + 0.45 * (tv / 255)))));
+        return LS_PACK(mixc(r, tr), mixc(g, tg), mixc(b, tb));
     },
-    // Оценки «пригодности» каждого биома для каждой ячейки поля (до argmax),
-    // затем каждое поле размывается. Так веса биомов меняются в пространстве
-    // непрерывно, а не скачком на границе региона → плавные переходы.
-    buildSoftBiome() {
-        const f = this.biomeField;
+    preparePalette() {
+        const L = this.landscape;
+        const s = L.seasons[this.currentSeason] || L.seasons.SUMMER;
+        const tone = hex => L._tone(hex, s.sat, s.light, s.tint);
+        const pal = L.pal = {
+            water: L.waterShades.map(tone), ice: L.iceShades.map(tone),
+            snow: tone(L.snow), snowShade: tone(L.snowShade), rock: tone(L.rock), trunk: tone(L.trunk),
+            broadleaf: L.broadleaf.map(tone), conifer: L.conifer.map(tone),
+            wheatStalk: tone(L.wheatStalk), wheatTop: tone(L.wheatTop),
+            season: s, biome: {}, colors: {},
+        };
+        for (const [id, shades] of Object.entries(L.palettes)) pal.biome[id] = shades.map(tone);
+        for (const [id, hex] of Object.entries(L.colors)) pal.colors[id] = tone(hex);
+        return pal;
+    },
+
+    /* ---------- Раскладка биомного поля в удобные массивы ---------- */
+    prepareField() {
+        const f = this.biomeField, L = this.landscape;
         const w = f.w, h = f.h, n = w * h;
-        const defs = this.biomeTypeDefs, nb = defs.length;
-        const scores = f.softBiome = new Float32Array(nb * n);
-        const cellElev = f.cellElev;
-        for (let j = 0; j < h; j++) {
-            const y = j * f.cell;
-            const lat = Math.abs(y / this.height - 0.5) * 2;
-            for (let i = 0; i < w; i++) {
-                const k = j * w + i;
-                const tval = cellElev ? cellElev[k] : 0;
-                const x = i * f.cell;
-                for (let b = 0; b < nb; b++) {
-                    const def = defs[b];
-                    if (def.isWater) continue;
-                    const ns = def.noise;
-                    const v = this.biomes._fbm(x / this.width * ns.freq, y / this.height * ns.freq, def.seedOffset, ns.octaves);
-                    const latFit = Math.max(0, 1 - Math.abs(lat - def.lat) / def.latTol);
-                    const elevFit = Math.max(0, 1 - Math.abs(tval - def.elev) / def.elevTol);
-                    scores[b * n + k] = ns.weight * v * (0.10 + latFit) * (0.05 + elevFit);
+        L.w = w; L.h = h;
+        const biomeIndex = {}; this.biomeTypeIds.forEach((id, i) => { biomeIndex[id] = i; });
+        L.cellBiome = new Uint8Array(n).fill(255);
+        L.water = new Uint8Array(n);
+        L.elev = new Float32Array(n);
+        L.temp = new Float32Array(n);
+        L.res = new Uint8Array(n);
+        L.depth = new Uint8Array(n);
+        L.shore = new Uint8Array(n);
+        L.river = new Uint8Array(n);
+
+        for (let k = 0; k < n; k++) {
+            const ri = f.regionOf[k];
+            const region = ri >= 0 ? this.terrain.regions.all[ri] : null;
+            const id = this.biomeTypeIds[f.dom[k]];
+            L.water[k] = f.water[k] ? 1 : 0;
+            L.elev[k] = region ? region.t : 0;
+            L.temp[k] = region ? (region.temperature ?? 0.5) : 0.5;
+            if (!L.water[k]) {
+                L.cellBiome[k] = biomeIndex[id] ?? 3;
+                if (['WOODLAND', 'FOREST', 'DENSE_FOREST'].includes(id)) L.res[k] = 1;
+                else if (['GRASSLAND', 'PLAINS', 'STEPPE'].includes(id)) L.res[k] = 2;
+                else if (['HIGHLANDS', 'PEAKS'].includes(id)) L.res[k] = 3;
+                if (lsUnit(k % w, (k / w) | 0, 88) < 0.012) L.res[k] = 4;
+            }
+        }
+
+        // Глубина воды: расстояние в клетках от берега (BFS).
+        const queue = [];
+        for (let k = 0; k < n; k++) {
+            if (!L.water[k]) continue;
+            const x = k % w, y = (k / w) | 0;
+            if ((x > 0 && !L.water[k - 1]) || (x < w - 1 && !L.water[k + 1]) ||
+                (y > 0 && !L.water[k - w]) || (y < h - 1 && !L.water[k + w])) { L.depth[k] = 1; queue.push(k); }
+        }
+        for (let head = 0; head < queue.length; head++) {
+            const k = queue[head], d = L.depth[k], x = k % w, y = (k / w) | 0;
+            const push = nk => { if (L.water[nk] && !L.depth[nk]) { L.depth[nk] = d + 1; queue.push(nk); } };
+            if (x > 0) push(k - 1);
+            if (x < w - 1) push(k + 1);
+            if (y > 0) push(k - w);
+            if (y < h - 1) push(k + w);
+        }
+
+        // Тип берега по биому.
+        for (let k = 0; k < n; k++) {
+            if (L.water[k]) continue;
+            const x = k % w, y = (k / w) | 0;
+            const nearWater = (x > 0 && L.water[k - 1]) || (x < w - 1 && L.water[k + 1]) ||
+                              (y > 0 && L.water[k - w]) || (y < h - 1 && L.water[k + w]);
+            if (!nearWater) continue;
+            const id = this.biomeTypeIds[f.dom[k]];
+            if (['PEAKS', 'HIGHLANDS'].includes(id)) L.shore[k] = 3;
+            else if (['BEACH', 'STEPPE'].includes(id)) L.shore[k] = 1;
+            else if (id === 'COAST') L.shore[k] = 2;
+            else L.shore[k] = lsUnit(x, y, 12) < 0.5 ? 1 : 2;
+        }
+
+        // Русла рек (растеризуем сегменты в клетки поля).
+        if (this.rivers && this.rivers.segments) {
+            const cell = f.cell;
+            for (const points of this.rivers.segments)
+                for (let i = 0; i < points.length; i++) {
+                    const cx = Math.min(w - 1, Math.max(0, (points[i].x / cell) | 0));
+                    const cy = Math.min(h - 1, Math.max(0, (points[i].y / cell) | 0));
+                    const k = cy * w + cx;
+                    if (!L.water[k]) L.river[k] = 1;
+                }
+        }
+    },
+
+    /* ---------- 1. Фон: дизеренный билинейный переход ---------- */
+    buildBase() {
+        const L = this.landscape;
+        const w = L.w, h = L.h, T = L.tilePx;
+        const W = L.pxWidth = w * T, H = L.pxHeight = h * T;
+        const pixels = L.pixels = new Int32Array(W * H);
+        L.waterMask = new Uint8Array(W * H);
+
+        const cell = L.cellColors = new Int32Array(w * h);
+        for (let k = 0; k < w * h; k++) cell[k] = this.landscape.cellColor(k);
+
+        // Таблицы выбора соседа (A B / C D) по позиции в клетке и сдвигу узора.
+        const quadOf = new Uint8Array(T * T);
+        const u = new Float32Array(T * T), v = new Float32Array(T * T);
+        for (let oy = 0; oy < T; oy++)
+            for (let ox = 0; ox < T; ox++) {
+                const px = (ox + 0.5) / T - 0.5, py = (oy + 0.5) / T - 0.5;
+                const pos = oy * T + ox;
+                quadOf[pos] = (Math.floor(px) + 1) + 2 * (Math.floor(py) + 1);
+                u[pos] = px - Math.floor(px); v[pos] = py - Math.floor(py);
+            }
+        const cache = {};
+        const choicesFor = (offX, offY) => {
+            const key = offX + 4 * offY;
+            if (cache[key]) return cache[key];
+            const soft = new Uint8Array(T * T), coast = new Uint8Array(T * T);
+            for (let oy = 0; oy < T; oy++)
+                for (let ox = 0; ox < T; ox++) {
+                    const pos = oy * T + ox;
+                    const th = LS_BAYER[((oy + offY) & 3) * 4 + ((ox + offX) & 3)];
+                    const pick = sharp => {
+                        const uu = Math.min(1, Math.max(0, (u[pos] - 0.5) * sharp + 0.5));
+                        const vv = Math.min(1, Math.max(0, (v[pos] - 0.5) * sharp + 0.5));
+                        const a = (1 - uu) * (1 - vv), b = uu * (1 - vv), c = (1 - uu) * vv;
+                        return th < a ? 0 : th < a + b ? 1 : th < a + b + c ? 2 : 3;
+                    };
+                    soft[pos] = pick(1.2); coast[pos] = pick(1.9);
+                }
+            cache[key] = { soft, coast };
+            return cache[key];
+        };
+        const cc = x => x < 0 ? 0 : x >= w ? w - 1 : x;
+        const cr = y => y < 0 ? 0 : y >= h ? h - 1 : y;
+        const qc = new Int32Array(16), qw = new Uint8Array(16), qs = new Uint8Array(4);
+
+        for (let cy = 0; cy < h; cy++) {
+            for (let cx = 0; cx < w; cx++) {
+                const color = cell[cy * w + cx];
+                let uniform = true;
+                for (let dy = -1; dy <= 1 && uniform; dy++)
+                    for (let dx = -1; dx <= 1; dx++) {
+                        const nx = cx + dx, ny = cy + dy;
+                        if (nx >= 0 && ny >= 0 && nx < w && ny < h && cell[ny * w + nx] !== color) { uniform = false; break; }
+                    }
+                if (uniform) {
+                    const water = L.water[cy * w + cx];
+                    for (let oy = 0; oy < T; oy++) {
+                        const start = (cy * T + oy) * W + cx * T;
+                        pixels.fill(color, start, start + T);
+                        L.waterMask.fill(water, start, start + T);
+                    }
+                    continue;
+                }
+                for (let q = 0; q < 4; q++) {
+                    const x0 = cc(cx + (q & 1) - 1), x1 = cc(cx + (q & 1));
+                    const y0 = cr(cy + (q >> 1) - 1), y1 = cr(cy + (q >> 1));
+                    qc[q * 4] = cell[y0 * w + x0]; qc[q * 4 + 1] = cell[y0 * w + x1];
+                    qc[q * 4 + 2] = cell[y1 * w + x0]; qc[q * 4 + 3] = cell[y1 * w + x1];
+                    qw[q * 4] = L.water[y0 * w + x0]; qw[q * 4 + 1] = L.water[y0 * w + x1];
+                    qw[q * 4 + 2] = L.water[y1 * w + x0]; qw[q * 4 + 3] = L.water[y1 * w + x1];
+                    const wc = qw[q * 4] + qw[q * 4 + 1] + qw[q * 4 + 2] + qw[q * 4 + 3];
+                    qs[q] = (wc > 0 && wc < 4) ? 1 : 0;
+                }
+                const tables = choicesFor((cx * T) & 3, (cy * T) & 3);
+                for (let oy = 0; oy < T; oy++) {
+                    const row = (cy * T + oy) * W + cx * T;
+                    for (let ox = 0; ox < T; ox++) {
+                        const pos = oy * T + ox, q = quadOf[pos];
+                        const chosen = q * 4 + (qs[q] === 1 ? tables.coast : tables.soft)[pos];
+                        pixels[row + ox] = qc[chosen];
+                        L.waterMask[row + ox] = qw[chosen];
+                    }
                 }
             }
         }
-        // Размытие каждого биомного поля сглаживает границы между биомами.
-        const r = Math.max(1, Math.round(this.landscape.feather * 2));
-        const tmp = new Float32Array(n);
-        for (let b = 0; b < nb; b++) {
-            if (defs[b].isWater) continue;
-            const sub = scores.subarray(b * n, b * n + n);
-            MapBiomes._blurField(sub, w, h, r, 2, tmp);
-        }
-        return scores;
     },
-    // Биом ячейки по мягким весам с дизерингом между двумя лидерами.
-    _biomeAt(fk, seed) {
-        const f = this.biomeField, sb = f.softBiome;
-        if (!sb) return null;
-        const defs = this.biomeTypeDefs, nb = defs.length, n = f.w * f.h;
-        let aB = -1, aS = 0, bB = -1, bS = 0;
-        for (let b = 0; b < nb; b++) {
-            if (defs[b].isWater) continue;
-            const s = sb[b * n + fk];
-            if (s <= 0) continue;
-            if (s > aS) { bB = aB; bS = aS; aB = b; aS = s; }
-            else if (s > bS) { bB = b; bS = s; }
+
+    // Цвет клетки по биому/воде/климату.
+    cellColor(k) {
+        const L = this.landscape, f = this.biomeField, pal = L.pal;
+        const w = L.w, x = k % w, y = (k / w) | 0;
+        const t = L.temp[k] + pal.season.tempShift;
+        if (L.water[k]) {
+            if (t < L.iceTemp && L.depth[k] > 0) return pal.ice[L.depth[k] <= 3 ? 0 : L.depth[k] <= 6 ? 1 : 2];
+            return pal.water[Math.min(pal.water.length - 1, Math.max(0, L.depth[k] - 1))];
         }
-        if (aB < 0) return null;
-        const tot = aS + bS;
-        const pa = tot > 0 ? aS / tot : 1;
-        const pick = this.landscape._hash(seed, 911) < pa ? aB : (bB >= 0 ? bB : aB);
-        return defs[pick].id;
-    },
-    // Билинейная выборка мягкой маски суши → плавный берег без ступеньки.
-    _sampleCover(wx, wy) {
-        const f = this.biomeField, lc = f.landCover;
-        if (!lc) return (f.water && f.water[0] === 1) ? 0 : 1;
-        const gx = wx / f.cell - 0.5, gy = wy / f.cell - 0.5;
-        const x0 = Math.floor(gx), y0 = Math.floor(gy);
-        const fx = gx - x0, fy = gy - y0;
-        const cx = v => Math.max(0, Math.min(f.w - 1, v));
-        const cy = v => Math.max(0, Math.min(f.h - 1, v));
-        const x0c = cx(x0), x1c = cx(x0 + 1), y0c = cy(y0), y1c = cy(y0 + 1);
-        const c00 = lc[y0c * f.w + x0c], c10 = lc[y0c * f.w + x1c];
-        const c01 = lc[y1c * f.w + x0c], c11 = lc[y1c * f.w + x1c];
-        return (c00 * (1 - fx) + c10 * fx) * (1 - fy) + (c01 * (1 - fx) + c11 * fx) * fy;
-    },
-    // Цвет пикселя: дизеринг вода/суша по мягкой маске + биом по мягким весам.
-    pixelColor(fk, i, j, climate, season, cover) {
-        const L = this.landscape;
-        const shift = L.climateShift[climate] || L.climateShift.temperate;
-        const seasonTint = this.seasons[season]?.tints?.land?.[climate];
-        const seed = (i * 73856093) ^ (j * 19349663);
-        const useWater = L._hash(seed, 555) > cover;
-        let pal, id;
-        if (useWater) {
-            if (this.biomeField.water && this.biomeField.water[fk] === 1) {
-                id = this.biomeTypeIds[this.biomeField.dom[fk]];
-                pal = L.palettes[id] || L.palettes.OCEAN;
-            } else {
-                id = 'OCEAN'; pal = L.palettes.OCEAN;   // мелководье у берега
-            }
-        } else {
-            id = L._biomeAt(fk, seed) || this.biomeTypeIds[this.biomeField.dom[fk]];
-            pal = L.palettes[id];
-            if (!pal) return this.biomeColorById[id] || '#000000';
-        }
-        const shade = (L._hash(seed, 7) * pal.length) | 0;
-        let col = pal[shade] || pal[0];
-        if (!useWater) {
-            if (shift.amt > 0) col = L._shift(col, shift.tint, shift.amt);
-            if (seasonTint && seasonTint.strength > 0) col = this.color.blend(col, seasonTint.color, seasonTint.strength * 0.5);
-            // Фактура биома: крупные пятна (кроны/заросли) + мелкая крапина.
-            const feat = L.features[id];
-            if (feat) {
-                const clumpSeed = (i >> 1) * 40503 ^ (j >> 1) * 2246822519;
-                if (L._hash(clumpSeed, 31) < feat.clumpP) col = L._shift(col, feat.clumpCol, 0.7);
-                else if (L._hash(seed, 53) < feat.hiP) col = L._shift(col, feat.hi, 0.55);
-                else if (L._hash(seed, 71) < feat.loP) col = L._shift(col, feat.lo, 0.55);
-            }
-        }
+        const shades = pal.biome[this.biomeTypeIds[f.dom[k]]] || pal.biome.PLAINS;
+        let col = shades[lsHash(x, y, 7) % shades.length];
+        const snow = Math.round(Math.min(1, Math.max(0, (L.snowTemp - t) / 0.16)) * 3) / 3;
+        if (snow > 0) col = lsMix(col, pal.snow, 0.9 * snow);
         return col;
     },
-    // Сборка фонового слоя (ImageData на весь мир, шаг = landscape.pixel).
-    build() {
-        const f = this.biomeField;
-        const L = this.landscape;
-        if (!f.dom || !f.regionOf) { L.canvas = null; return null; }
-        const px = Math.max(1, L.pixel);
-        const w = L.w = Math.max(1, Math.ceil(this.width / px));
-        const h = L.h = Math.max(1, Math.ceil(this.height / px));
-        const season = this.currentSeason;
-        const c = document.createElement('canvas'); c.width = w; c.height = h;
-        const g = c.getContext('2d');
-        const img = g.createImageData(w, h);
-        const data = img.data;
 
-        for (let j = 0; j < h; j++) {
-            const wy = j * px;
-            for (let i = 0; i < w; i++) {
-                const k = j * w + i;
-                const wx = i * px;
-                // биом/климат — с грубой сетки поля (быстро), суша — по маске
-                const fi = Math.min(f.w - 1, (wx / f.cell) | 0);
-                const fj = Math.min(f.h - 1, (wy / f.cell) | 0);
-                const fk = fj * f.w + fi;
-                const ri = f.regionOf[fk];
-                const region = ri >= 0 ? this.terrain.regions.all[ri] : null;
-                const cover = L._sampleCover(wx, wy);
-                const climate = region?.climateZone || 'temperate';
-                const col = L.pixelColor(fk, i, j, climate, season, cover);
-                const rgb = this.color.hexToRgb(col);
-                const o = k * 4;
-                data[o] = rgb.r; data[o + 1] = rgb.g; data[o + 2] = rgb.b; data[o + 3] = 255;
+    /* ---------- 2. Светотень холмов ---------- */
+    buildHills() {
+        const L = this.landscape;
+        const w = L.w, h = L.h, W = L.pxWidth, T = L.tilePx, pixels = L.pixels;
+        for (let cy = 0; cy < h; cy++) {
+            for (let cx = 0; cx < w; cx++) {
+                const k = cy * w + cx;
+                if (L.water[k] || L.river[k]) continue;
+                for (let oy = 0; oy < T; oy++) {
+                    for (let ox = 0; ox < T; ox++) {
+                        const gx = cx * T + ox, gy = cy * T + oy, p = gy * W + gx;
+                        if (L.waterMask[p]) continue;
+                        const th = LS_BAYER[(gy & 3) * 4 + (gx & 3)];
+                        const nw = (cx > 0 && cy > 0) ? L.elev[(cy - 1) * w + cx - 1] : L.elev[k];
+                        const se = (cx < w - 1 && cy < h - 1) ? L.elev[(cy + 1) * w + cx + 1] : L.elev[k];
+                        let step = Math.round(((se - nw) * 0.9 + (L.elev[k] - 0.4) * 0.5) * 2.6 + (th - 0.5) * 0.6);
+                        step = step < -2 ? -2 : step > 2 ? 2 : step;
+                        if (step !== 0) pixels[p] = lsShade(pixels[p], LS_SHADE_STEPS[step + 2]);
+                    }
+                }
             }
         }
+    },
+
+    /* ---------- 3. Берега и пена ---------- */
+    buildShores() {
+        const L = this.landscape;
+        const w = L.w, h = L.h, W = L.pxWidth, T = L.tilePx;
+        const pixels = L.pixels, c = L.pal.colors, pal = L.pal;
+        const snowAt = k => Math.round(Math.min(1, Math.max(0, (L.snowTemp - (L.temp[k] + pal.season.tempShift)) / 0.16)) * 3) / 3;
+        for (let cy = 0; cy < h; cy++) {
+            for (let cx = 0; cx < w; cx++) {
+                const k = cy * w + cx;
+                if (L.water[k] || L.river[k]) continue;
+                const nearW = (cx > 0 && L.water[k - 1]) || (cx < w - 1 && L.water[k + 1]) ||
+                              (cy > 0 && L.water[k - w]) || (cy < h - 1 && L.water[k + w]);
+                if (!nearW) continue;
+                const type = L.shore[k], snow = snowAt(k);
+                for (let oy = 0; oy < T; oy++) {
+                    for (let ox = 0; ox < T; ox++) {
+                        const gx = cx * T + ox, gy = cy * T + oy, p = gy * W + gx;
+                        const th = LS_BAYER[(gy & 3) * 4 + (gx & 3)];
+                        const d = Math.min(ox, oy, T - 1 - ox, T - 1 - oy);
+                        let col = 0;
+                        if (type === 1) { if (d <= 0) col = c.wetSand; else if (th < 0.7) col = lsUnit(gx, gy, 620) < 0.18 ? c.wetSand : c.sand; }
+                        else if (type === 2) { if (th < 0.6) { const r = lsUnit(gx, gy, 621); col = r < 0.3 ? c.pebbleLight : r < 0.55 ? c.pebbleDark : lsMix(pixels[p], c.stoneMid, 0.6); } }
+                        else if (type === 3) { if (d <= 1 && th < 0.7) col = lsShade(pixels[p], -50); }
+                        if (col !== 0) pixels[p] = snow > 0 ? lsMix(col, pal.snow, 0.9 * snow) : col;
+                    }
+                }
+                // Пена на прилегающей воде.
+                for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+                    const x = cx + dx, y = cy + dy;
+                    if (x < 0 || y < 0 || x >= w || y >= h) continue;
+                    const wk = y * w + x;
+                    if (!L.water[wk] || L.temp[wk] + pal.season.tempShift < L.iceTemp) continue;
+                    for (let oy = 0; oy < T; oy++)
+                        for (let ox = 0; ox < T; ox++) {
+                            const edge = dx !== 0 ? (dx > 0 ? ox === 0 : ox === T - 1) : (dy > 0 ? oy === 0 : oy === T - 1);
+                            if (!edge) continue;
+                            const gx = x * T + ox, gy = y * T + oy, p = gy * W + gx;
+                            if (LS_BAYER[(gy & 3) * 4 + (gx & 3)] < 0.75) pixels[p] = lsMix(pixels[p], LS_WHITE, type === 1 ? 0.4 : 0.28);
+                        }
+                }
+            }
+        }
+    },
+
+    /* ---------- 4. Реки ---------- */
+    buildRivers() {
+        const L = this.landscape;
+        const w = L.w, h = L.h, W = L.pxWidth, T = L.tilePx;
+        const pixels = L.pixels, pal = L.pal;
+        L.riverMask = new Uint8Array(W * h * T);
+        const shades = pal.water.slice(0, 3);
+        for (let cy = 0; cy < h; cy++) {
+            for (let cx = 0; cx < w; cx++) {
+                const k = cy * w + cx;
+                if (!L.river[k]) continue;
+                const frozen = L.temp[k] + pal.season.tempShift < 0.12;
+                const col = frozen ? pal.ice[0] : shades[1];
+                const bank = 1 + Math.max(0, Math.round(T * 0.15));
+                for (let oy = -bank; oy < T + bank; oy++) {
+                    for (let ox = -bank; ox < T + bank; ox++) {
+                        const gx = cx * T + ox, gy = cy * T + oy;
+                        if (gx < 0 || gy < 0 || gx >= W || gy >= h * T) continue;
+                        const p = gy * W + gx;
+                        const inside = ox >= 0 && oy >= 0 && ox < T && oy < T;
+                        const th = LS_BAYER[(gy & 3) * 4 + (gx & 3)];
+                        if (inside) {
+                            const edge = ox === 0 || oy === 0 || ox === T - 1 || oy === T - 1;
+                            if (!edge || th < 0.8) { pixels[p] = col; L.riverMask[p] = 1; }
+                        } else if (!L.waterMask[p] && th < 0.3) {
+                            pixels[p] = lsShade(pixels[p], -55); // мокрый берег
+                        }
+                    }
+                }
+            }
+        }
+    },
+
+    /* ---------- 5. Текстура: крапинки и трава ---------- */
+    buildTexture() {
+        const L = this.landscape, f = this.biomeField;
+        const w = L.w, h = L.h, W = L.pxWidth, T = L.tilePx;
+        const pixels = L.pixels;
+        const specks = Math.max(1, Math.round(T * T / 16));
+        for (let cy = 0; cy < h; cy++) {
+            for (let cx = 0; cx < w; cx++) {
+                const k = cy * w + cx;
+                if (L.water[k]) continue;
+                let hh = lsHash(cx, cy, 200) | 1;
+                for (let n = 0; n < specks; n++) {
+                    hh ^= hh << 13; hh ^= hh >>> 17; hh ^= hh << 5;
+                    const r = hh >>> 0;
+                    const p = (cy * T + (r >>> 8) % T) * W + cx * T + r % T;
+                    if (!L.waterMask[p] && !L.riverMask[p]) pixels[p] = lsSpeck(pixels[p], (r >>> 20) & 1);
+                }
+                if (L.river[k] || L.shore[k] === 1) continue;
+                const id = this.biomeTypeIds[f.dom[k]];
+                if (!['GRASSLAND', 'PLAINS', 'STEPPE', 'WOODLAND', 'COAST', 'WETLANDS'].includes(id)) continue;
+                const count = Math.round((id === 'GRASSLAND' ? 3 : 2) * (0.6 + lsUnit(cx, cy, 401)));
+                for (let n = 0; n < count; n++) {
+                    const hx = lsHash(cx, cy, 410 + n);
+                    const bx = cx * T + (hx % T), by = cy * T + ((hx >>> 8) % T);
+                    const gp = by * W + bx;
+                    if (bx >= W || by >= h * T || L.waterMask[gp] || L.riverMask[gp]) continue;
+                    const dark = lsShade(pixels[gp], -56), light = lsShade(pixels[gp], 46);
+                    const blades = 2 + ((hx >>> 16) % 2);
+                    for (let b = 0; b < blades; b++) {
+                        const bh = 1 + ((hx >>> (20 + b)) & 1);
+                        for (let st = 0; st < bh; st++) {
+                            const q = (by - st) * W + (bx + b);
+                            if (q >= 0 && q < W * h * T && bx + b < W) pixels[q] = st === bh - 1 ? light : dark;
+                        }
+                    }
+                }
+            }
+        }
+    },
+
+    /* ---------- 6. Горы: карта высот с наклонной проекцией ---------- */
+    buildRelief() {
+        const L = this.landscape, f = this.biomeField;
+        const w = L.w, h = L.h, W = L.pxWidth, T = L.tilePx;
+        const pixels = L.pixels, pal = L.pal;
+        const lift = T * 2;
+
+        const mh = new Float32Array(w * h);
+        for (let k = 0; k < w * h; k++) {
+            if (L.water[k]) continue;
+            const id = this.biomeTypeIds[f.dom[k]];
+            mh[k] = id === 'PEAKS' ? 1 : id === 'HIGHLANDS' ? 0.7 : Math.max(0, (L.elev[k] - 0.55) / 0.45);
+        }
+        const blurred = new Float32Array(w * h);
+        for (let y = 0; y < h; y++)
+            for (let x = 0; x < w; x++) {
+                let sum = 0, cnt = 0;
+                for (let dy = -1; dy <= 1; dy++)
+                    for (let dx = -1; dx <= 1; dx++) {
+                        const nx = x + dx, ny = y + dy;
+                        if (nx >= 0 && ny >= 0 && nx < w && ny < h) { sum += mh[ny * w + nx]; cnt++; }
+                    }
+                blurred[y * w + x] = Math.min(1, (sum / cnt) * 1.8);
+            }
+
+        // Строки с рельефом: для каждой ty — список tx.
+        const rows = Array.from({ length: h }, () => []);
+        let any = false;
+        for (let y = 0; y < h; y++)
+            for (let x = 0; x < w; x++) {
+                let near = false;
+                for (let dy = -1; dy <= 1 && !near; dy++)
+                    for (let dx = -1; dx <= 1; dx++) {
+                        const nx = x + dx, ny = y + dy;
+                        if (nx >= 0 && ny >= 0 && nx < w && ny < h && blurred[ny * w + nx] > 0.01) { near = true; break; }
+                    }
+                if (near) { rows[y].push(x); any = true; }
+            }
+        if (!any) return;
+
+        const rock = pal.rock, snow = pal.snow, snowShade = pal.snowShade;
+        const ramp = [-0.30, -0.14, 0.05, 0.20, 0.34].map(a => lsShade(rock, a));
+        const snowRamp = [lsMix(snowShade, rock, 0.3), snowShade, lsMix(snow, snowShade, 0.5), snow, snow];
+        const proj = new Int32Array(W), face = new Int32Array(W), valid = new Uint8Array(W);
+        const crest = new LsNoise(W, Math.max(6, T * 3), 501);
+
+        for (let ty = 0; ty < h; ty++) {
+            if (!rows[ty].length) continue;
+            for (let gy = ty * T; gy < (ty + 1) * T; gy++) {
+                const bayerRow = (gy & 3) * 4;
+                for (const tx of rows[ty]) {
+                    const tile = ty * w + tx;
+                    const base = blurred[tile];
+                    const snowLevel = 0.95 - Math.min(1, Math.max(0, (0.36 - (L.temp[tile] + pal.season.tempShift)) / 0.3)) * 0.6;
+                    for (let gx = tx * T; gx < (tx + 1) * T; gx++) {
+                        const k = gy * W + gx;
+                        const hh = base * (0.62 + 0.85 * crest.at(gx, gy));
+                        const bth = LS_BAYER[bayerRow + (gx & 3)];
+                        if (hh < 0.02) {
+                            if (valid[gx]) { for (let y = Math.max(0, proj[gx] + 1); y <= gy - 1; y++) pixels[y * W + gx] = face[gx]; valid[gx] = 0; }
+                            continue;
+                        }
+                        let tone = Math.round(2 + (hh - 0.45) * 2.6 + (bth - 0.5) * 0.35);
+                        tone = tone < 0 ? 0 : tone > 4 ? 4 : tone;
+                        const palette = hh + (bth - 0.5) * 0.08 > snowLevel ? snowRamp : ramp;
+                        const color = palette[tone], faceColor = palette[tone > 0 ? tone - 1 : 0];
+                        const lifted = gy - Math.round(hh * lift);
+                        if (valid[gx] && lifted - proj[gx] > 1)
+                            for (let y = proj[gx] + 1; y <= lifted - 1; y++) pixels[y * W + gx] = faceColor;
+                        if (lifted >= 0) pixels[lifted * W + gx] = color;
+                        proj[gx] = lifted; face[gx] = faceColor; valid[gx] = 1;
+                    }
+                }
+            }
+        }
+    },
+
+    /* ---------- 7. Деревья, поля, руда, разломы ---------- */
+    collectDecor() {
+        const L = this.landscape;
+        const w = L.w, h = L.h, T = L.tilePx;
+        const items = [];
+        for (let cy = 0; cy < h; cy++) {
+            for (let cx = 0; cx < w; cx++) {
+                const k = cy * w + cx;
+                if (L.water[k] || L.river[k]) continue;
+                const res = L.res[k];
+                if (res === 1) {
+                    const conifer = L.temp[k] + L.pal.season.tempShift < 0.42;
+                    const n = 1 + (lsHash(cx, cy, 31) % 2);
+                    for (let i = 0; i < n; i++) {
+                        const bx = Math.round(cx * T + T / 2 + (lsUnit(cx, cy, 40 + i) - 0.5) * 0.5 * T);
+                        const by = Math.round(cy * T + T * 0.7 + (lsUnit(cx, cy, 50 + i) - 0.5) * 0.5 * T);
+                        const pick = lsHash(cx, cy, 60 + i);
+                        items.push({ y: by, x: bx, draw: () => conifer ? this.landscape.drawConifer(bx, by, pick) : this.landscape.drawBroadleaf(bx, by, pick) });
+                    }
+                } else if (res === 2) items.push({ y: Math.round(cy * T + T * 0.7), x: cx * T, draw: () => this.landscape.drawWheat(cx, cy) });
+                else if (res === 3) items.push({ y: Math.round(cy * T + T * 0.7), x: cx * T, draw: () => this.landscape.drawOre(cx, cy) });
+                else if (res === 4) items.push({ y: Math.round(cy * T + T * 0.7), x: cx * T, draw: () => this.landscape.drawRift(cx, cy) });
+            }
+        }
+        items.sort((a, b) => a.y - b.y || a.x - b.x);
+        return items;
+    },
+    put(x, y, color) {
+        const L = this.landscape;
+        if (x >= 0 && y >= 0 && x < L.pxWidth && y < L.pxHeight) L.pixels[y * L.pxWidth + x] = color;
+    },
+    blendPx(x, y, color, alpha) {
+        const L = this.landscape;
+        if (x < 0 || y < 0 || x >= L.pxWidth || y >= L.pxHeight) return;
+        const k = y * L.pxWidth + x;
+        L.pixels[k] = lsMix(L.pixels[k], color, alpha);
+    },
+    drawShadow(cx, base, width) {
+        const half = Math.floor(width / 2);
+        for (let dx = -half; dx <= half; dx++) this.landscape.blendPx(cx + dx, base, LS_BLACK, 0.22);
+        for (let dx = -half + 1; dx <= half - 1; dx++) this.landscape.blendPx(cx + dx, base + 1, LS_BLACK, 0.12);
+    },
+    drawBroadleaf(cx, base, pick) {
+        const L = this.landscape, pal = L.pal, T = L.tilePx;
+        if (pal.season.bare) { this.landscape.drawBareTree(cx, base, pick); return; }
+        const width = Math.max(2, Math.round(T * 0.55)) + (pick % 2);
+        const height = width, trunkH = Math.max(1, Math.round(width * 0.35));
+        const color = pal.broadleaf[pick % pal.broadleaf.length];
+        const light = lsShade(color, 55), dark = lsShade(color, -70);
+        const top = base - trunkH - height + 2;
+        this.landscape.drawShadow(cx, base, width);
+        for (let r = 0; r < trunkH; r++) this.landscape.put(cx, base - r, pal.trunk);
+        for (let row = 0; row < height; row++) {
+            const t = ((row + 0.5) / height) * 2 - 1;
+            const half = (width / 2) * Math.sqrt(Math.max(0, 1 - t * t));
+            for (let x = Math.round(cx - half); x <= Math.round(cx + half) - 1; x++) {
+                const lean = (x - cx) + (row - height / 2);
+                let shade = lean < -width * 0.2 ? light : lean > width * 0.28 ? dark : color;
+                if (lsUnit(x, top + row, 77) < 0.12) shade = shade === dark ? color : dark;
+                this.landscape.put(x, top + row, shade);
+            }
+        }
+        if (pal.season.blossom && pick % 3 === 0) {
+            const bl = LS_HEX('#f0c2d0');
+            this.landscape.put(cx - 1, top + 2, bl); this.landscape.put(cx + 1, top + 3, bl);
+        }
+    },
+    drawBareTree(cx, base, pick) {
+        const L = this.landscape, trunk = L.pal.trunk, T = L.tilePx;
+        const height = Math.max(3, Math.round(T * 0.9));
+        this.landscape.drawShadow(cx, base, Math.max(2, Math.round(T * 0.5)));
+        for (let y = base - height; y <= base; y++) this.landscape.put(cx, y, trunk);
+        for (let k = 1; k <= Math.max(1, Math.round(height * 0.4)); k++) {
+            this.landscape.put(cx - k, base - height + k + 1, trunk);
+            this.landscape.put(cx + k, base - height + k + 1, trunk);
+        }
+    },
+    drawConifer(cx, base, pick) {
+        const L = this.landscape, pal = L.pal, T = L.tilePx;
+        const color = pal.conifer[pick % pal.conifer.length];
+        const light = lsShade(color, 50), dark = lsShade(color, -70);
+        const height = Math.max(3, Math.round(T * 1.1)), maxHalf = Math.max(1, Math.round(T * 0.35));
+        const top = base - height + 1;
+        this.landscape.drawShadow(cx, base, maxHalf * 2);
+        this.landscape.put(cx, base, pal.trunk);
+        for (let row = 0; row < height; row++) {
+            const tierRow = row % 3;
+            const half = Math.min(maxHalf, Math.floor(row * 0.34 + tierRow * 0.3 + 0.4));
+            for (let dx = -half; dx <= half; dx++) {
+                let shade = dx < 0 ? light : dx > 0 ? dark : color;
+                if (pal.season.snow && tierRow === 0) shade = dx > 0 ? pal.snowShade : pal.snow;
+                this.landscape.put(cx + dx, top + row, shade);
+            }
+        }
+    },
+    drawWheat(cx, cy) {
+        const L = this.landscape, pal = L.pal, T = L.tilePx;
+        const stage = pal.season.wheat;
+        const n = Math.max(2, Math.round(T));
+        const stalkH = Math.max(1, Math.round((stage <= 0.3 ? 0.25 : stage <= 0.6 ? 0.45 : 0.65) * T));
+        for (let i = 0; i < n; i++) {
+            const hh = lsHash(cx, cy, 300 + i);
+            const sx = cx * T + (hh % T), sy = cy * T + Math.round(T * 0.4) + ((hh >>> 8) % Math.max(1, T - Math.round(T * 0.4)));
+            for (let s = 0; s < stalkH; s++) this.landscape.put(sx, sy - s, pal.wheatStalk);
+            this.landscape.put(sx, sy - stalkH, pal.wheatTop);
+            if (stage >= 0.85) this.landscape.put(sx, sy - stalkH - 1, pal.wheatTop);
+        }
+    },
+    drawOre(cx, cy) {
+        const L = this.landscape, c = L.pal.colors, T = L.tilePx;
+        const ox = cx * T + Math.round(T * 0.35), oy = cy * T + Math.round(T * 0.5);
+        const size = Math.max(1, Math.round(T * 0.22));
+        const nugget = (gx, gy, s) => {
+            for (let yy = 0; yy < s; yy++) for (let xx = 0; xx < s; xx++) this.landscape.put(gx + xx, gy + yy, c.gold);
+            this.landscape.put(gx, gy, c.goldLight);
+            this.landscape.put(gx + s, gy + 1, c.goldShadow);
+        };
+        nugget(ox, oy, size);
+        nugget(ox - size * 2, oy + 1, 1);
+        nugget(ox + size * 2, oy - 1, 1);
+    },
+    drawRift(cx, cy) {
+        const L = this.landscape, c = L.pal.colors, T = L.tilePx;
+        const ox = cx * T + Math.round(T * 0.5), oy = cy * T + Math.round(T * 0.5);
+        const pts = [[-0.3, 0.3], [0, 0], [0.3, -0.3]].map(([dx, dy]) => [Math.round(ox + dx * T), Math.round(oy + dy * T)]);
+        for (const [px, py] of pts)
+            for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) this.landscape.blendPx(px + dx, py + dy, c.riftGlow, 0.16);
+        pts.forEach(([px, py], i) => this.landscape.put(px, py, i % 2 === 0 ? c.riftCore : c.riftDark));
+    },
+
+    /* ---------- 8. Границы регионов ---------- */
+    buildBorders() {
+        const L = this.landscape, f = this.biomeField;
+        const w = L.w, h = L.h, W = L.pxWidth, T = L.tilePx;
+        const pixels = L.pixels, color = L.pal.colors.regionBorder;
+        for (let cy = 0; cy < h; cy++)
+            for (let cx = 0; cx < w; cx++) {
+                const k = cy * w + cx, rid = f.regionOf[k];
+                if (rid < 0) continue;
+                const right = cx < w - 1 ? f.regionOf[k + 1] : -1;
+                const below = cy < h - 1 ? f.regionOf[k + w] : -1;
+                if (right !== -1 && right !== rid)
+                    for (let oy = 0; oy < T; oy++) {
+                        const p = (cy * T + oy) * W + (cx * T + T - 1);
+                        if (!L.riverMask[p]) pixels[p] = lsMix(pixels[p], color, 0.4);
+                    }
+                if (below !== -1 && below !== rid)
+                    for (let ox = 0; ox < T; ox++) {
+                        const p = (cy * T + T - 1) * W + (cx * T + ox);
+                        if (!L.riverMask[p]) pixels[p] = lsMix(pixels[p], color, 0.4);
+                    }
+            }
+    },
+
+    /* ---------- 9. Цветокоррекция, туман, виньетка ---------- */
+    buildFog() {
+        const L = this.landscape;
+        const W = L.pxWidth, H = L.pxHeight;
+        const step = Math.max(2, Math.round(L.tilePx / 2));
+        const lw = Math.ceil(W / step) + 2, lh = Math.ceil(H / step) + 2;
+        const low = new Uint8Array(lw * lh);
+        const broad = new LsNoise(W, Math.max(8, L.tilePx * 12), 901);
+        const fine = new LsNoise(W, Math.max(4, L.tilePx * 5), 902);
+        for (let ly = 0; ly < lh; ly++) {
+            const y = Math.min(H - 1, ly * step);
+            for (let lx = 0; lx < lw; lx++) {
+                const x = Math.min(W - 1, lx * step);
+                const noise = 0.65 * broad.at(x, y) + 0.35 * fine.at(x, y);
+                const base = noise <= 0.5 ? 0 : Math.min(1, (noise - 0.5) / 0.3);
+                low[ly * lw + lx] = Math.min(255, Math.round(Math.pow(base, 1.3) * 0.28 * 255 * (L.waterMask[y * W + x] ? 1.15 : 1)));
+            }
+        }
+        const fog = new Uint8Array(W * H), weight = 256 / step;
+        for (let y = 0; y < H; y++) {
+            const rowA = ((y / step) | 0) * lw, rowB = rowA + lw, wy = (y % step) * weight;
+            for (let x = 0; x < W; x++) {
+                const lx = (x / step) | 0, wx = (x % step) * weight;
+                const top = low[rowA + lx] * (256 - wx) + low[rowA + lx + 1] * wx;
+                const bottom = low[rowB + lx] * (256 - wx) + low[rowB + lx + 1] * wx;
+                fog[y * W + x] = (top * (256 - wy) + bottom * wy) >> 16;
+            }
+        }
+        L.fog = fog;
+    },
+    applyGrading() {
+        const L = this.landscape;
+        const W = L.pxWidth, H = L.pxHeight, pixels = L.pixels, fog = L.fog;
+        const lutR = new Uint8Array(256), lutG = new Uint8Array(256), lutB = new Uint8Array(256);
+        for (let v = 0; v < 256; v++) {
+            const base = Math.min(255, Math.round(255 * Math.pow(v / 255, 1.14)));
+            lutR[v] = Math.min(255, Math.round(base * 0.95));
+            lutG[v] = Math.min(255, Math.round(base * 0.98));
+            lutB[v] = Math.min(255, Math.round(base * 1.04));
+        }
+        const vignette = 0.35;
+        const vx = new Int32Array(W), vy = new Int32Array(H);
+        for (let x = 0; x < W; x++) vx[x] = Math.round(256 * (1 - vignette * (1 - lsSmooth(Math.min(1, Math.min(x, W - 1 - x) / (W * 0.3))))));
+        for (let y = 0; y < H; y++) vy[y] = Math.round(256 * (1 - vignette * (1 - lsSmooth(Math.min(1, Math.min(y, H - 1 - y) / (H * 0.3))))));
+        for (let y = 0; y < H; y++) {
+            const rowShade = vy[y];
+            for (let x = 0; x < W; x++) {
+                const k = y * W + x, color = pixels[k];
+                let r = lutR[color & 255], g = lutG[(color >>> 8) & 255], b = lutB[(color >>> 16) & 255];
+                const a = fog[k];
+                if (a > 0) { r += ((150 - r) * a) >> 8; g += ((162 - g) * a) >> 8; b += ((170 - b) * a) >> 8; }
+                const shade = (vx[x] * rowShade) >> 8;
+                pixels[k] = 0xFF000000 | (((b * shade) >> 8) << 16) | (((g * shade) >> 8) << 8) | ((r * shade) >> 8);
+            }
+        }
+    },
+
+    /* ---------- Сборка ---------- */
+    build() {
+        const f = this.biomeField, L = this.landscape;
+        if (!f.dom || !f.regionOf) { L.canvas = null; return null; }
+        L.tilePx = Math.max(2, Math.round(this.landscapeTileSize || L.tilePx));
+        this.landscape.preparePalette();
+        this.landscape.prepareField();
+        this.landscape.buildBase();
+        this.landscape.buildFog();
+        this.landscape.buildHills();
+        this.landscape.buildShores();
+        this.landscape.buildRivers();
+        this.landscape.buildRelief();
+        this.landscape.buildTexture();
+        const items = this.landscape.collectDecor();
+        for (const it of items) it.draw();
+        this.landscape.buildBorders();
+        this.landscape.applyGrading();
+
+        const c = document.createElement('canvas');
+        c.width = L.pxWidth; c.height = L.pxHeight;
+        const g = c.getContext('2d');
+        const img = g.createImageData(L.pxWidth, L.pxHeight);
+        new Uint8Array(img.data.buffer).set(new Uint8Array(L.pixels.buffer, 0, L.pixels.length * 4));
         g.putImageData(img, 0, 0);
         L.canvas = c;
-        L.tintKey = season;
+        L.tintKey = this.currentSeason;
         return c;
     },
     ensure() {
@@ -1612,6 +2164,7 @@ const MapLandscape = {
         ctx.drawImage(c, 0, 0, this.width, this.height);
         ctx.restore();
     },
+
     },
 };
 

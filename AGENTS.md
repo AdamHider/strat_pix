@@ -49,18 +49,24 @@ Browser strategy game. No build step: plain JS + a single `map.html` entry point
   per-key count map now (all town sets have 1–2 variants).
 
 ## Landscape renderer (`MapLandscape`)
-- The map background is a single cached pixel-art canvas built from the biome
-  noise, not from region polygons. `landscape.pixel` (world units per pixel,
-  default 2) controls grain; smaller = finer.
-- Per-biome weight fields (`MapBiomes.buildSoftBiome` → `biomeField.softBiome`,
-  one blurred Float32 field per biome) give smooth spatial biome transitions.
-  `MapLandscape._biomeAt` picks between the two leading biomes with dithering.
-- Coast is soft: `MapBiomes.buildLandCover` blurs the binary water mask into
-  `biomeField.landCover` (0..1) and `_sampleCover` samples it bilinearly; pixels
-  dither to water when `hash > cover`. The hard polygon `paintCoastline` is now
-  drawn only in flat-fill modes (factions/resources/culture).
-- `landscape.features[biome]` bakes texture (clumps/hi/lo speckle) so forest
-  reads as crowns, steppe as wheat, peaks as rock — the noise *is* the graphics.
-- `landscape.build()` re-renders only when the season changes (`tintKey`);
-  `_paintTerrainContent` blits it first, then rivers/owner tint/decor.
+- The whole map background is one cached pixel-art canvas built from the biome
+  noise field, not from region polygons. `landscapeTile` (px per biome cell,
+  default 6) sets the grain; smaller = finer.
+- `MapLandscape.build()` runs once after rivers are generated (called from
+  `MapGenerator.generate`) and re-runs on season change (`tintKey`). It writes
+  into `landscape.pixels` (Uint32Array), puts them on `landscape.canvas`.
+- Layer order inside `build()`: base biome colours (dithered at cell edges) →
+  hills/relief → shores → rivers → texture → decor → borders → fog → grading.
+  All layers are plain per-pixel writes; no per-layer canvases, composites,
+  `ImageBitmap`, or LOD caches.
+- `landscape.cellColors` is a per-cell colour cache (`Int32Array`); do not name
+  it `cellColor` — that would shadow the `cellColor(k)` method.
+- Beware typed-array overflow: values that can reach 256 (e.g. the vignette
+  factors) must not live in a `Uint8Array`; use `Int32Array`/`Float32Array`.
+- Decorations (`this.decorations`) are disabled — the landscape draws trees,
+  grass, rocks and fields itself. `MapDecorations` / `MapPixelDecor` code is
+  dead unless re-enabled.
+- `viewMode` is a colour switch only. In flat-fill modes
+  (`factions`/`culture`/resources) the landscape is skipped and
+  `paintCoastline` draws the polygon edge instead.
 
