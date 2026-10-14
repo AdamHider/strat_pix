@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HexRealms</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/d3-delaunay@6"></script>
+    <script src="AssetManager.js"></script>
+    <script src="MapGenerator.js"></script>
+    <script src="TurnManager .js"></script>
+    <script src="FactionsManager.js"></script>
+    <script src="DiplomacyManager.js"></script>
+    <script src="AIManager.js"></script>
+    <script src="ArmyManager.js"></script>
+    <script src="Game.js"></script>
+    <style>
+        html, body { margin: 0; padding: 0; overflow: hidden; }
+        #gameCanvas { position: fixed; inset: 0; width: 100vw; height: 100vh; display: block; }
+    </style>
+</head>
+<body class="bg-slate-950 text-slate-100">
+
+    <canvas id="gameCanvas"></canvas>
+    <svg style="display:none;">
+    <filter id="coastline-warp">
+        <feTurbulence type="fractalNoise" baseFrequency="0.03" numOctaves="3" result="noise" />
+        <feDisplacementMap in="SourceGraphic" in2="noise" scale="12" xChannelSelector="R" yChannelSelector="G" />
+    </filter>
+    </svg>
+    <div id="mapTooltip" class="hidden fixed z-50 pointer-events-none bg-slate-900 border border-emerald-700 text-slate-100 text-xs rounded-lg shadow-2xl px-3 py-2 max-w-[220px] leading-relaxed"></div>
+
+    <!-- ═══════════ Меню "Новая игра" — поверх канваса, скрывается после старта ═══════════ -->
+    <div id="newGameMenu" class="fixed inset-0 z-40 bg-slate-950/95 flex items-center justify-center p-4">
+        <div class="bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-2xl w-full max-w-md flex flex-col gap-4">
+            <h1 class="text-lg font-bold text-emerald-400">Новая игра</h1>
+
+            <div class="flex flex-col gap-1.5">
+                <div class="flex justify-between items-center text-xs">
+                    <span class="text-slate-300 font-semibold">Сид мира:</span>
+                    <label class="flex items-center gap-1 text-[10px] text-emerald-400 cursor-pointer select-none">
+                        <input type="checkbox" id="menuRandomSeed" checked class="accent-emerald-500"> Случайный
+                    </label>
+                </div>
+                <input type="text" id="menuSeed" value="12345" disabled class="w-full bg-slate-950 border border-slate-800 text-xs rounded-lg px-2 py-1 font-mono disabled:opacity-50">
+            </div>
+
+            <div class="flex flex-col gap-1.5">
+                <div class="flex justify-between text-xs">
+                    <span class="text-slate-300">Плотность полигонов:</span>
+                    <span id="menuValRegionCount" class="text-emerald-400 font-mono">2500</span>
+                </div>
+                <input type="range" id="menuRegionCount" min="500" max="4000" step="100" value="2500"
+                    oninput="document.getElementById('menuValRegionCount').textContent = this.value"
+                    class="w-full accent-emerald-500 cursor-pointer">
+            </div>
+
+            <div class="flex flex-col gap-1.5">
+                <label class="text-xs text-slate-300">Тип мира:</label>
+                <select id="menuShapeType" class="bg-slate-950 border border-slate-800 text-xs rounded-xl p-2.5 cursor-pointer">
+                    <option value="continent" selected>Континент</option>
+                    <option value="two_continents">Два континента</option>
+                    <option value="island">Один остров</option>
+                </select>
+            </div>
+
+            <div class="flex flex-col gap-1.5">
+                <div class="flex justify-between text-xs">
+                    <span class="text-slate-300">Количество суши:</span>
+                    <span id="menuValLandAmount" class="text-emerald-400 font-mono">0.8</span>
+                </div>
+                <input type="range" id="menuLandAmount" min="0.5" max="1.6" step="0.05" value="0.8"
+                    oninput="document.getElementById('menuValLandAmount').textContent = this.value"
+                    class="w-full accent-emerald-500 cursor-pointer">
+            </div>
+
+            <div class="flex flex-col gap-1.5">
+                <div class="flex justify-between text-xs">
+                    <span class="text-slate-300">Рельеф:</span>
+                    <span id="menuValRelief" class="text-emerald-400 font-mono">0.9</span>
+                </div>
+                <input type="range" id="menuRelief" min="0" max="1" step="0.05" value="0.9"
+                    oninput="document.getElementById('menuValRelief').textContent = this.value"
+                    class="w-full accent-emerald-500 cursor-pointer">
+            </div>
+
+            <div class="flex flex-col gap-1.5">
+                <div class="flex justify-between text-xs">
+                    <span class="text-slate-300">Хаотичность:</span>
+                    <span id="menuValChaos" class="text-emerald-400 font-mono">0.2</span>
+                </div>
+                <input type="range" id="menuChaos" min="0" max="1" step="0.05" value="0.2"
+                    oninput="document.getElementById('menuValChaos').textContent = this.value"
+                    class="w-full accent-emerald-500 cursor-pointer">
+            </div>
+
+            <div class="flex flex-col gap-1.5">
+                <div class="flex justify-between text-xs">
+                    <span class="text-slate-300">Количество фракций:</span>
+                    <span id="menuValFactionCount" class="text-emerald-400 font-mono">25</span>
+                </div>
+                <input type="range" id="menuFactionCount" min="4" max="70" step="1" value="25"
+                    oninput="document.getElementById('menuValFactionCount').textContent = this.value"
+                    class="w-full accent-emerald-500 cursor-pointer">
+            </div>
+            
+
+            <button id="startGameBtn" class="mt-2 w-full py-2.5 bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-semibold text-sm rounded-xl shadow transition transform active:scale-95">
+                Начать игру
+            </button>
+        </div>
+    </div>
+
+    <!-- ═══════════ HUD поверх карты — видна только во время игры ═══════════ -->
+    <!-- ═══ Верх по центру: ресурсная панель с прогнозом ═══ -->
+    <div id="gameHud">
+        <div id="resourceBar" class="fixed top-3 left-1/2 -translate-x-1/2 z-30 flex gap-1 pointer-events-none">
+            <div class="bg-slate-900/95 border border-slate-700 rounded-lg px-3 py-1.5 flex gap-4 pointer-events-auto shadow-lg">
+                <div class="flex flex-col items-center min-w-[54px]">
+                    <span class="text-[10px] text-slate-400">🌾 Еда</span>
+                    <span id="resFood" class="text-sm font-semibold text-emerald-300">0</span>
+                </div>
+                <div class="w-px bg-slate-700"></div>
+                <div class="flex flex-col items-center min-w-[54px]">
+                    <span class="text-[10px] text-slate-400">⚙️ Произв.</span>
+                    <span id="resProduction" class="text-sm font-semibold text-sky-300">0</span>
+                </div>
+                <div class="w-px bg-slate-700"></div>
+                <div class="flex flex-col items-center min-w-[54px]">
+                    <span class="text-[10px] text-slate-400">⚙️ Эфир.</span>
+                    <span id="resEther" class="text-sm font-semibold text-sky-300">0</span>
+                </div>
+                <div class="w-px bg-slate-700"></div>
+                <div class="flex flex-col items-center min-w-[64px]">
+                    <span class="text-[10px] text-slate-400">🪙 Золото</span>
+                    <div>
+                        <span id="resGold" class="text-sm font-semibold text-amber-300">0</span>
+                        <span id="resGoldForecast" class="text-[9px] text-slate-500">→ 0</span>
+                    </div>
+                </div>
+                <div class="w-px bg-slate-700"></div>
+                <div class="flex flex-col items-center min-w-[64px]">
+                    <span class="text-[10px] text-slate-400">👥 Manpower</span>
+                    <div>
+                        <span id="resManpower" class="text-sm font-semibold text-rose-300">0</span>
+                        <span id="resManpowerForecast" class="text-[9px] text-slate-500">→ 0</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ═══ Верх справа: ход + фракции ═══ -->
+        <div class="fixed top-3 right-3 z-30 flex flex-col items-end gap-1 pointer-events-none">
+            <div class="bg-slate-900/95 border border-slate-700 rounded-lg px-3 py-1.5 text-xs pointer-events-auto">
+                <span id="hudTurn" class="font-semibold">Ход 1</span>
+                <span class="text-slate-500 mx-1">·</span>
+                <span id="hudFactionsAlive" class="text-slate-400">Фракций: 0</span>
+            </div>
+            <select id="hudSeason" onchange="game.setSeason(this.value)"
+                    class="bg-slate-900/95 border border-slate-700 text-xs rounded-lg px-2 py-1 pointer-events-auto">
+                <option value="SPRING" selected>Весна</option>
+                <option value="SUMMER">Лето</option>
+                <option value="AUTUMN">Осень</option>
+                <option value="WINTER">Зима</option>
+            </select>
+        </div>
+
+        <!-- ═══ Право, под шапкой: лог ИИ ═══ -->
+        <div id="aiLog" class="hidden fixed top-24 left-3 z-30 bg-slate-900/95 border border-slate-700 rounded-xl p-3 text-xs w-64 max-h-56 overflow-y-auto"></div>
+
+        <!-- ═══ Низ по центру-справа: слой карты + завершить ход ═══ -->
+        <div class="fixed bottom-3 right-3 z-30 flex items-center gap-2 pointer-events-none">
+            <select id="hudViewMode" onchange="game.setViewMode(this.value)"
+                    class="bg-slate-900/95 border border-slate-700 text-xs rounded-lg px-2 py-2 pointer-events-auto">
+                <option value="terrain" selected>Рельеф + климат</option>
+                <option value="political">Рельеф + фракции</option>
+                <option value="factions">Карта фракций</option>
+                <option value="gold">Золото</option>
+                <option value="food">Еда</option>
+                <option value="production">Промышленность</option>
+                <option value="manpower">Население</option>
+                <option value="culture">Культура</option>
+                
+            </select>
+            <button id="endTurnBtn" onclick="endTurnClicked()"
+                    class="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-bold text-sm rounded-xl shadow-lg pointer-events-auto transition transform active:scale-95">
+                Завершить ход
+            </button>
+            <button onclick="skipAiAnimation = true" class="fixed bottom-24 right-3 z-50 px-3 py-1.5 bg-slate-800/90 hover:bg-slate-700 text-xs rounded-lg pointer-events-auto">
+                Пропустить ⏭
+            </button>
+        </div>
+
+        <!-- ═══ Низ слева: зум над инфопанелью ═══ -->
+        <div class="fixed bottom-[300px] left-3 z-30 flex flex-col gap-1 pointer-events-none">
+            <button onclick="game.zoomIn()" class="w-9 h-9 bg-slate-900/95 hover:bg-slate-800 border border-slate-700 rounded-lg text-sm pointer-events-auto">+</button>
+            <button onclick="game.resetView()" class="w-9 h-9 bg-slate-900/95 hover:bg-slate-800 border border-slate-700 rounded-lg text-xs pointer-events-auto">⟲</button>
+            <button onclick="game.zoomOut()" class="w-9 h-9 bg-slate-900/95 hover:bg-slate-800 border border-slate-700 rounded-lg text-sm pointer-events-auto">−</button>
+        </div>
+
+        <!-- ═══ Низ слева: инфопанель с вкладками (как была) ═══ -->
+        <div id="infoPanel" class="fixed bottom-3 left-3 z-30 bg-slate-900/95 border border-slate-700 rounded-xl text-xs w-72 overflow-hidden flex flex-col">
+            <div class="flex border-b border-slate-700">
+                <button id="tabRegionBtn" onclick="switchTab('region')" class="flex-1 px-3 py-2 text-xs font-semibold transition">Регион</button>
+                <button id="tabArmyBtn" onclick="switchTab('army')" class="flex-1 px-3 py-2 text-xs font-semibold transition border-l border-slate-700">Армия</button>
+            </div>
+            <div id="tabRegionContent" class="p-3"></div>
+            <div id="tabArmyContent" class="p-3 hidden"></div>
+        </div>
+        <button onclick="openDiplomacyWindow()" class="fixed top-16 right-3 z-30 px-3 py-1.5 bg-slate-900/95 border border-slate-700 hover:bg-slate-800 rounded-lg text-xs">
+            🤝 Дипломатия
+        </button>
+        
+        <div id="diplomacyModal" class="hidden fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-4">
+            <div class="bg-slate-900 border border-slate-700 rounded-xl w-full max-w-lg max-h-[80vh] flex flex-col">
+                <div class="flex justify-between items-center p-4 border-b border-slate-700">
+                    <h2 class="font-semibold text-emerald-400">Дипломатия</h2>
+                    <button onclick="closeDiplomacyWindow()" class="text-slate-400 hover:text-white">✕</button>
+                </div>
+                <div id="diplomacyList" class="overflow-y-auto p-3 flex flex-col gap-2"></div>
+            </div>
+        </div>
+        <div id="aiTurnOverlay" class="hidden fixed inset-0 z-40 bg-black/70 flex items-center justify-center pointer-events-none">
+            <div class="flex flex-col items-center gap-3 transition-opacity duration-200" id="aiTurnCard">
+                <img id="aiTurnFlag" src="" class="w-24 h-16 object-cover rounded-md border-2 border-slate-600 shadow-2xl" />
+                <div id="aiTurnName" class="text-2xl font-bold text-slate-100 tracking-wide"></div>
+                <div class="text-xs text-slate-400 uppercase tracking-widest">Ход фракции</div>
+            </div>
+        </div>
+    </div>
+    <script>
+        let game;
+        let activeTab = 'region';
+        let lastRegion = null;
+        let lastArmy = null;
+        let lastArmyReachable = [];
+
+        let aiTurnSpeed = 50; 
+        let skipAiAnimation = false;
+
+        function switchTab(tab) {
+            activeTab = tab;
+
+            document.getElementById('tabRegionContent').classList.toggle('hidden', tab !== 'region');
+            document.getElementById('tabArmyContent').classList.toggle('hidden', tab !== 'army');
+
+            document.getElementById('tabRegionBtn').className =
+                `flex-1 px-3 py-2 text-xs font-semibold transition ${tab === 'region' ? 'bg-emerald-700 text-white' : 'bg-slate-900 text-slate-400 hover:bg-slate-800'}`;
+            document.getElementById('tabArmyBtn').className =
+                `flex-1 px-3 py-2 text-xs font-semibold transition border-l border-slate-700 ${tab === 'army' ? 'bg-emerald-700 text-white' : 'bg-slate-900 text-slate-400 hover:bg-slate-800'}`;
+        }
+        function startGame() {
+            const isRandom = document.getElementById('menuRandomSeed').checked;
+            const seed = isRandom
+                ? Math.floor(Math.random() * 9999999) + 1
+                : parseInt(document.getElementById('menuSeed').value) || 12345;
+
+            document.getElementById('newGameMenu').classList.add('hidden');
+            document.getElementById('gameHud').classList.remove('hidden');
+
+            game = new Game({
+                canvas: document.getElementById('gameCanvas'),
+                tooltip: document.getElementById('mapTooltip'),
+                onRegionSelected: (region) => {
+                    if (region) {
+                        switchTab('region');
+                        renderRegionTab(region);
+                    } else {
+                        renderRegionTab(null);
+                    }
+                },
+                onArmySelected: (army, reachableIds) => {
+                    switchTab('army');
+                    renderArmyTab(army, reachableIds);
+                },
+                onGameReady: (state) => { updateHud(); },
+                onTurnEnd: (summary) => {
+                    document.getElementById('hudTurn').textContent = `Ход ${summary.turnNumber}`;
+                    updateHud();
+                    if (lastRegion) renderRegionTab(game.mapGen.getRegionData(game.mapGen.terrain.regions.all[lastRegion.id]));
+                    if (lastArmy) {
+                        const freshArmy = game.armyManager.list.find(a => a.id === lastArmy.id);
+                        renderArmyTab(freshArmy || null, freshArmy ? [] : []); // если армия погибла/пропала — покажет "не выбрана"
+                    }
+                },
+                onSeasonChange: (season) => {
+                    document.getElementById('hudSeason').value = season;
+                },
+                onFactionEliminated: (faction) => {
+                    updateHud();
+                },
+                onAIAction: (factionId, action, details) => {
+                    const faction = game.factionsManager.get(factionId);
+                    const target = game.factionsManager.get(details.target);
+                    const log = document.getElementById('aiLog');
+                    log.classList.remove('hidden');
+
+                    const labels = { declare_war: 'объявила войну', make_peace: 'заключила мир с' };
+                    const line = document.createElement('div');
+                    line.textContent = `${faction.name} ${labels[action]} ${target.name}`;
+                    log.prepend(line);
+                },
+            });
+
+            game.newGame({
+                seed,
+                regionCount: parseInt(document.getElementById('menuRegionCount').value),
+                shapeType: document.getElementById('menuShapeType').value,
+                landAmount: parseFloat(document.getElementById('menuLandAmount').value),
+                relief: parseFloat(document.getElementById('menuRelief').value),
+                chaos: parseFloat(document.getElementById('menuChaos').value),
+                factionCount: parseInt(document.getElementById('menuFactionCount').value),
+                playerFactionId: 0,
+            });
+            initInfoPanel()
+        }
+
+        
+        function renderRegionTab(region) {
+            lastRegion = region;
+            const container = document.getElementById('tabRegionContent');
+
+            if (!region) {
+                container.innerHTML = `<div class="text-slate-500 italic">Регион не выбран</div>`;
+                return;
+            }
+            /*
+            if (mapRegion.hidden) {
+                container.innerHTML = `<div class="text-slate-400 italic">Территория неизвестна</div>`;
+                return;
+            }*/
+
+            const mapRegion = game.getRegionFullInfo(region);
+            const biomeLabel = game.mapGen.elevationBandLabels[region.biome] || region.biome;
+            const res = region.resources;
+
+            const forecast = game.mapGen.getRegionResourcesForecast(mapRegion.region);
+            const hasPendingChange = mapRegion.region.pendingSpecialization !== null && mapRegion.region.pendingSpecialization !== undefined;
+            const effectiveSpec = mapRegion.region.pendingSpecialization ?? mapRegion.region.specialization;
+
+            
+            let html = `
+                <div class="font-semibold text-emerald-400 mb-1">${region.name} · ${biomeLabel}</div>
+                <div>Еда ${res.food.toFixed(1)} · Произв. ${res.production.toFixed(1)}</div> · Эфир. ${res.ether.toFixed(1)}</div>
+                <div>Золото ${res.gold.toFixed(1)} · Содержание ${res.upkeep.toFixed(1)}</div>
+                ${hasPendingChange ? `<div class="text-amber-400 text-[10px] mt-1">След. ход: 🌾${forecast.food.toFixed(1)} ⚙️${forecast.production.toFixed(1)} 'Э'${forecast.ether.toFixed(1)} 🪙${forecast.gold.toFixed(1)}</div>` : ''}
+            `;
+
+            if (region.city) html += `<div class="mt-1">Поселение: ${region.city.name}</div>`;
+            if (region.population > 0) html += `<div>Население: ${region.population}</div>`;
+
+            if (mapRegion.faction) {
+                html += renderFactionListItem(mapRegion.faction)
+                const factionCultureIcon = mapRegion.faction.culture ? game.mapGen.cultureIconById[mapRegion.faction.culture] : '';
+                html += `<hr class="my-2 border-slate-700">
+                        <div class="font-semibold" style="color: ${mapRegion.faction.color}">
+                            ${factionCultureIcon} ${mapRegion.faction.name}${mapRegion.isPlayerOwned ? ' (игрок)' : ''}
+                        </div>`;
+                if (mapRegion.diplomacy) {
+                    const labels = { peace: 'Мир', war: 'Война', alliance: 'Союз' };
+                    html += `<div>Отношения: ${labels[mapRegion.diplomacy]}</div>`;
+                }
+            } else {
+                html += `<div class="mt-2 text-slate-400">Ничейная территория</div>`;
+            }
+
+            if (mapRegion.region.culture) {
+                const loyalty = game.mapGen.getRegionLoyalty(mapRegion);
+                const sortedCultures = Object.entries(mapRegion.region.culture).sort((a, b) => b[1] - a[1]);
+
+                html += `<hr class="my-2 border-slate-700">
+                        <div class="text-slate-400 text-[10px] mb-1">Культурный состав:</div>`;
+
+                sortedCultures.forEach(([id, share]) => {
+                    if (share < 0.01) return; // не показываем совсем незаметные доли
+                    const label = game.mapGen.cultureLabelById[id];
+                    const icon = game.mapGen.cultureIconById[id];
+                    const pct = (share * 100).toFixed(0);
+                    html += `
+                        <div class="flex items-center gap-1.5 text-[10px] mb-0.5">
+                            <span>${icon}</span>
+                            <span class="flex-1">${label}</span>
+                            <div class="w-16 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                                <div class="h-full rounded-full" style="width:${pct}%; background:${game.mapGen.cultureColorById[id]}"></div>
+                            </div>
+                            <span class="w-7 text-right">${pct}%</span>
+                        </div>`;
+                });
+
+                if (mapRegion.ownerId !== null && mapRegion.ownerId !== undefined) {
+                    const ownerFaction = game.factionsManager.get(mapRegion.ownerId);
+                    const ownerCultureIcon = ownerFaction?.culture ? game.mapGen.cultureIconById[ownerFaction.culture] : '';
+                    html += `<div class="mt-1 text-[10px] text-amber-300">
+                                ${ownerCultureIcon} Лояльность: ${(loyalty * 100).toFixed(0)}%
+                            </div>`;
+                }
+            }
+            if (!mapRegion.isWater) {
+                html += `
+                    <hr class="my-2 border-slate-700">
+                    <label class="text-slate-400 text-[10px]">Специализация:</label>
+                    <select onchange="setSpecialization(${region.id}, this.value)" class="w-full mt-1 text-xs bg-slate-800 rounded px-1 py-1">
+                        ${game.mapGen.specializationDefs.map(s =>
+                            `<option value="${s.id}" ${effectiveSpec === s.id ? 'selected' : ''}>${s.label}</option>`
+                        ).join('')}
+                    </select>
+                    ${hasPendingChange ? `<div class="text-amber-400 text-[10px] mt-1">Вступит в силу в след. ход</div>` : ''}
+                `;
+            }
+
+            const player = game.factionsManager.getPlayer();
+            const canRecruit = player && game.armyManager.canRecruitAt(player.id, region.id);
+            if (canRecruit) {
+                html += `<hr class="my-2 border-slate-700">
+                        <button onclick="recruitHere(${region.id})" class="w-full px-2 py-1 bg-emerald-700 hover:bg-emerald-600 rounded text-xs">
+                            Нанять армию (💰${game.armyManager.recruitCost.gold} 👥${game.armyManager.recruitCost.manpower})
+                        </button>`;
+            }
+
+            container.innerHTML = html;
+        }
+        function renderArmyTab(army, reachableIds) {
+            lastArmy = army;
+            lastArmyReachable = reachableIds || [];
+            const container = document.getElementById('tabArmyContent');
+
+            if (!army) {
+                container.innerHTML = `<div class="text-slate-500 italic">Армия не выбрана</div>`;
+                return;
+            }
+
+            const faction = game.factionsManager.get(army.factionId);
+            const region = game.mapGen.terrain.regions.all[army.regionId];
+
+            let html = `
+                <div class="font-semibold" style="color: ${faction?.color}">${faction?.name}</div>
+                <div>Сила: ${army.strength}</div>
+                <div>Очков хода: ${army.actionPoints}</div>
+                <div>Регион: ${region?.name ?? '—'}</div>
+                <div class="text-slate-400">Доступно клеток для перемещения: ${lastArmyReachable.length}</div>
+            `;
+
+            const canReinforce = game.armyManager.canRecruitAt(army.factionId, army.regionId);
+            if (canReinforce) {
+                html += `<hr class="my-2 border-slate-700">
+                        <button onclick="reinforceSelectedArmy(5)" class="w-full px-2 py-1 bg-emerald-700 hover:bg-emerald-600 rounded text-xs">
+                            Пополнить +5 (💰${(5 * game.armyManager.reinforceCostPerStrength.gold).toFixed(0)} 👥${(5 * game.armyManager.reinforceCostPerStrength.manpower).toFixed(0)})
+                        </button>`;
+            }
+
+            container.innerHTML = html;
+        }
+
+        function reinforceSelectedArmy(amount) {
+            if (!lastArmy) return;
+            const result = game.armyManager.reinforceArmy(lastArmy.id, amount);
+            if (!result.success) { alert('Не удалось пополнить армию: ' + result.reason); return; }
+            renderArmyTab(result.army, lastArmyReachable);
+            updateHud(); 
+        }
+        function setSpecialization(regionId, specId) {
+            const result = game.mapGen.setRegionSpecialization(regionId, specId);
+            renderRegionTab(game.mapGen.getRegionData(game.mapGen.terrain.regions.all[regionId]));
+            updateHud(); 
+        }
+
+        function recruitHere(regionId) {
+            const player = game.factionsManager.getPlayer();
+            const result = game.armyManager.recruitArmy(player.id, regionId);
+            if (!result.success) { alert('Не удалось нанять армию: ' + result.reason); return; }
+            renderRegionTab(game.mapGen.getRegionData(game.mapGen.terrain.regions.all[regionId]));
+            updateHud(); 
+        }
+        function updateHud() {
+            updateResourceBar();
+            document.getElementById('hudFactionsAlive').textContent = `Фракций: ${game.factionsManager.getAlive().length}`;
+        }
+        function updateResourceBar() {
+            const forecast = game.getPlayerForecast();
+            if (!forecast) return;
+
+            document.getElementById('resFood').textContent = forecast.food.toFixed(1);
+            document.getElementById('resProduction').textContent = forecast.production.toFixed(1);
+            document.getElementById('resEther').textContent = forecast.ether.toFixed(1);
+            
+            document.getElementById('resGold').textContent = Math.round(forecast.gold.current);
+            const goldForecastEl = document.getElementById('resGoldForecast');
+            goldForecastEl.textContent = `→ ${Math.round(forecast.gold.next)}`;
+            goldForecastEl.className = `text-[9px] ${forecast.gold.delta >= 0 ? 'text-emerald-500' : 'text-rose-500'}`;
+
+            document.getElementById('resManpower').textContent = Math.round(forecast.manpower.current);
+            const mpForecastEl = document.getElementById('resManpowerForecast');
+            mpForecastEl.textContent = `→ ${Math.round(forecast.manpower.next)}`;
+            mpForecastEl.className = `text-[9px] ${forecast.manpower.delta >= 0 ? 'text-emerald-500' : 'text-rose-500'}`;
+        }
+        function showArmyPanel(army, reachableIds) {
+            document.getElementById('regionPanel').classList.add('hidden');
+            const panel = document.getElementById('armyPanel');
+            panel.classList.remove('hidden');
+
+            const faction = game.factionsManager.get(army.factionId);
+            panel.innerHTML = `
+                <div class="font-semibold" style="color: ${faction?.color}">${faction?.name}</div>
+                <div>Армия: сила ${army.strength}</div>
+                <div>Очков хода: ${army.actionPoints}</div>
+                <div class="text-slate-400">Доступно клеток: ${reachableIds.length}</div>
+            `;
+        }
+        function renderFactionListItem(faction) {
+            const flagImg = game.mapGen.factions.getFactionFlagImage(faction);
+            const flagHtml = flagImg
+                ? `<img src="${flagImg.src}" class="w-5 h-4 object-cover rounded-sm border border-slate-700">`
+                : `<span class="w-5 h-4 rounded-sm inline-block" style="background: linear-gradient(90deg, ${faction.colorPair ? game.mapGen.factionColorById[faction.colorPair.primary] : faction.color} 50%, ${faction.colorPair ? game.mapGen.factionColorById[faction.colorPair.secondary] : faction.color} 50%)"></span>`;
+
+            return `<div class="flex items-center gap-2 py-1">
+                        ${flagHtml}
+                        <span>${faction.name}</span>
+                    </div>`;
+        }
+        function openDiplomacyWindow() {
+            document.getElementById('diplomacyModal').classList.remove('hidden');
+            renderDiplomacyList();
+        }
+        function closeDiplomacyWindow() {
+            document.getElementById('diplomacyModal').classList.add('hidden');
+        }
+
+        function renderDiplomacyList() {
+            const player = game.factionsManager.getPlayer();
+            const container = document.getElementById('diplomacyList');
+            if (!player) { container.innerHTML = ''; return; }
+
+            const known = game.getKnownFactions(player.id); // см. пункт 5 — метод в Game
+
+            container.innerHTML = known.map(faction => {
+                const relation = game.getRelationLevel(player.id, faction.id);
+                const status = game.getDiplomacyStatus(player.id, faction.id);
+                const flagImg = game.mapGen.factions.getFactionFlagImage(faction);
+                const relationColor = relation > 30 ? 'text-emerald-400' : relation < -30 ? 'text-rose-400' : 'text-slate-400';
+
+                const statusLabels = { peace: 'Мир', war: 'Война', alliance: 'Союз' };
+
+                let actions = '';
+                if (status === 'peace') {
+                    actions = `<button onclick="game.declareWar(${player.id}, ${faction.id}); renderDiplomacyList()" class="px-2 py-1 bg-red-800 hover:bg-red-700 rounded text-[10px]">Объявить войну</button>
+                            <button onclick="game.proposeAlliance(${player.id}, ${faction.id}); renderDiplomacyList()" class="px-2 py-1 bg-blue-800 hover:bg-blue-700 rounded text-[10px]">Предложить союз</button>`;
+                } else if (status === 'war') {
+                    actions = `<button onclick="game.makePeace(${player.id}, ${faction.id}); renderDiplomacyList()" class="px-2 py-1 bg-emerald-800 hover:bg-emerald-700 rounded text-[10px]">Предложить мир</button>`;
+                }
+
+                return `
+                    <div class="flex items-center gap-3 bg-slate-800/60 rounded-lg p-2">
+                        ${flagImg ? `<img src="${flagImg.src}" class="w-6 h-5 rounded-sm object-cover">` : `<span class="w-6 h-5 rounded-sm" style="background:${faction.color}"></span>`}
+                        <div class="flex-1">
+                            <div class="text-xs font-semibold">${faction.name}</div>
+                            <div class="text-[10px] ${relationColor}">Отношения: ${relation > 0 ? '+' : ''}${relation} · ${statusLabels[status]}</div>
+                        </div>
+                        <div class="flex gap-1">${actions}</div>
+                    </div>`;
+            }).join('') || `<div class="text-slate-500 text-xs italic">Известных фракций нет</div>`;
+        }
+        function showAiTurnCard(faction) {
+            const overlay = document.getElementById('aiTurnOverlay');
+            const card = document.getElementById('aiTurnCard');
+            const flagImg = document.getElementById('aiTurnFlag');
+            const nameEl = document.getElementById('aiTurnName');
+
+            overlay.classList.remove('hidden');
+
+            const flag = game.mapGen.factions.getFactionFlagImage(faction);
+            flagImg.src = flag ? flag.src : '';
+            flagImg.style.visibility = flag ? 'visible' : 'hidden';
+            nameEl.textContent = faction.name;
+            nameEl.style.color = faction.color;
+
+            card.style.opacity = '1';
+        }
+
+        function hideAiTurnCard() {
+            document.getElementById('aiTurnOverlay').classList.add('hidden');
+        }
+
+        function sleep(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+        async function endTurnClicked() {
+            skipAiAnimation = false; 
+            const btn = document.getElementById('endTurnBtn');
+            btn.disabled = true;
+            btn.classList.add('opacity-50', 'cursor-not-allowed');
+            const summary = await game.endTurn();
+            await game.mapGen.shake();
+            hideAiTurnCard();
+            btn.disabled = false;
+            btn.classList.remove('opacity-50', 'cursor-not-allowed');
+
+            if (summary) {
+                document.getElementById('hudTurn').textContent = `Ход ${summary.turnNumber}`;
+                updateHud();
+                if (lastRegion) renderRegionTab(game.mapGen.getRegionData(game.mapGen.terrain.regions.all[lastRegion.id]));
+                if (lastArmy) {
+                    const freshArmy = game.armyManager.list.find(a => a.id === lastArmy.id);
+                    renderArmyTab(freshArmy || null, []);
+                }
+            }
+        }
+
+        function initInfoPanel() {
+            switchTab('region');
+            renderRegionTab(null);
+            renderArmyTab(null);
+        }
+        document.getElementById('menuRandomSeed').addEventListener('change', (e) => {
+            document.getElementById('menuSeed').disabled = e.target.checked;
+        });
+
+        document.getElementById('startGameBtn').addEventListener('click', startGame);
+    </script>
+</body>
+</html>
