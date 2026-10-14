@@ -48,3 +48,19 @@ Browser strategy game. No build step: plain JS + a single `map.html` entry point
   in `icons/`; a count that is too high spams the console with 404s. Towns use a
   per-key count map now (all town sets have 1–2 variants).
 
+## Landscape renderer (`MapLandscape`)
+- The map background is a single cached pixel-art canvas built from the biome
+  noise, not from region polygons. `landscape.pixel` (world units per pixel,
+  default 2) controls grain; smaller = finer.
+- Per-biome weight fields (`MapBiomes.buildSoftBiome` → `biomeField.softBiome`,
+  one blurred Float32 field per biome) give smooth spatial biome transitions.
+  `MapLandscape._biomeAt` picks between the two leading biomes with dithering.
+- Coast is soft: `MapBiomes.buildLandCover` blurs the binary water mask into
+  `biomeField.landCover` (0..1) and `_sampleCover` samples it bilinearly; pixels
+  dither to water when `hash > cover`. The hard polygon `paintCoastline` is now
+  drawn only in flat-fill modes (factions/resources/culture).
+- `landscape.features[biome]` bakes texture (clumps/hi/lo speckle) so forest
+  reads as crowns, steppe as wheat, peaks as rock — the noise *is* the graphics.
+- `landscape.build()` re-renders only when the season changes (`tintKey`);
+  `_paintTerrainContent` blits it first, then rivers/owner tint/decor.
+

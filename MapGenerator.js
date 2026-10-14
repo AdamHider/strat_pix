@@ -4,6 +4,10 @@ class MapGenerator {
         this.height = options.height || 600;
         this.borderMargin = options.borderMargin || 22;
         this.biomeCellSize = options.biomeCell ?? 6;
+        // Размер «пикселя» ландшафта в мировых единицах и радиус смягчения
+        // береговой линии. Меньше pixel → мельче зерно карты.
+        this.landscapePixelSize = options.landscapePixel ?? 2;
+        this.landscapeFeather = options.landscapeFeather ?? 1;
 
         this.showClimate = options.showClimate ?? true;
         this.currentSeason = options.currentSeason ?? 'SUMMER';
@@ -161,6 +165,7 @@ class MapGenerator {
                 all: [],
                 render: MapTerrain.renderRegions.bind(this)
             },
+            usesFlatFill: MapTerrain.usesFlatFill.bind(this),
             createTemperatures: MapTerrain.createTemperatures.bind(this),
             createRegions: MapTerrain.createRegions.bind(this),
             addBlob: MapTerrain.addBlob.bind(this),
@@ -196,6 +201,7 @@ class MapGenerator {
             cellAt: MapBiomes.cellAt.bind(this),
             mixAt: MapBiomes.mixAt.bind(this),
             buildFieldCanvas: MapBiomes.buildFieldCanvas.bind(this),
+            buildLandCover: MapBiomes.buildLandCover.bind(this),
             paintField: MapBiomes.paintField.bind(this),
         };
         this.assets = new AssetManager({
@@ -461,7 +467,26 @@ class MapGenerator {
             OCEAN:        { keys: ['wave'],                      density: 1.0, sizePct: [0.5, 0.6] },
             DEEP_OCEAN:   { keys: ['wave'],                      density: 1.0, sizePct: [0.5, 0.6] },
         };
-        this.biomeField = { cell: this.biomeCellSize, w: 0, h: 0, dom: null, canvas: null };
+        this.biomeField = { cell: this.biomeCellSize, w: 0, h: 0, dom: null, canvas: null,
+                            regionOf: null, water: null, landCover: null, blurTmp: null };
+
+        // ── Пиксельный ландшафт (dark fantasy pixel art) ─────────────
+        // Весь фон карты строится из биомного шума: каждый «пиксель»
+        // ландшафта — блок world-единиц (landscape.pixel). На границах
+        // биомов цвет дизерится/смешивается → плавный переход.
+        this.landscape = {
+            pixel: this.landscapePixelSize,
+            feather: this.landscapeFeather,
+            canvas: null,
+            w: 0,
+            h: 0,
+            tintKey: null,
+        };
+        this.landscape = {
+            ...this.landscape,
+            ...MapLandscape.data,
+            ...Object.fromEntries(Object.entries(MapLandscape.methods).map(([k, f]) => [k, f.bind(this)])),
+        };
 
         this.seasons = {
             SPRING: {
@@ -872,6 +897,8 @@ class MapGenerator {
         // Биомное поле: растеризуем шум по регионам → biomeMix, доминирующий
         // биом, isWater, ресурсы и стоимость движения.
         this.biomes.buildField(regions, voronoi, isWater, t);
+        this.landscape.buildSoftBiome();
+        this.biomes.buildLandCover();
         this.biomes.assignRegions(regions);
 
         regions.forEach(region => {
@@ -957,7 +984,12 @@ class MapGenerator {
         this.ctx.translate(vt.x, vt.y);
         this.ctx.scale(vt.scale, vt.scale);
         this.ctx.drawImage(this.staticCanvas, 0, 0);
-        if (this.viewMode === 'biomes') this.biomes.paintField(this.ctx, 0.9);
+        if (this.viewMode === 'biomes') {
+            this.ctx.save();
+            this.ctx.imageSmoothingEnabled = false;
+            this.biomes.paintField(this.ctx, 0.9);
+            this.ctx.restore();
+        }
         this.renderDynamicObjects(this.ctx, this.getVisibleWorldRect());
         this.ctx.restore();
 
@@ -1009,10 +1041,18 @@ class MapGenerator {
         this._staticDirty = false;
     }
     _paintTerrainContent(ctx, rect = null) {
+        // 1. Пиксельный биомный ландшафт — база всей графики карты.
+        if (!this.terrain.usesFlatFill()) this.landscape.paint(ctx);
+        // 2. Регионы: плоская заливка (для режимов фракций/ресурсов) и/или
+        //    цвет владельца поверх ландшафта.
         this.terrain.regions.render(ctx, rect);
+        // 3. Реки и мосты. Береговую линию в обычном обзоре задаёт мягкая
+        //    маска суши в ландшафте; жёсткий полигонный контур нужен лишь
+        //    в режимах со сплошной заливкой регионов.
         this.rivers.paint(ctx, rect);
         this.rivers.paintBridges(ctx, rect);
-        this.paintCoastline(ctx, rect);
+        if (this.terrain.usesFlatFill()) this.paintCoastline(ctx, rect);
+        // 4. Декор из биомной смеси: деревья/трава/камни по биомам.
         this.decorations.paintTextures(ctx, rect);
         this.pixelDecor.paint(ctx, rect, 0.4)
     }
@@ -1173,12 +1213,40 @@ const MapBiomes = {
         }
         return best;
     },
+    // Мягкая маска суши: бинарное «вода/суша» размывается в непрерывное
+    // поле 0..1. Нужна, чтобы береговая линия была плавной, а под пиксель-
+    // арт декором лежал мягкий градиент (а не ступенька по полигону).
+    _blurField(src, w, h, radius, passes, tmp) {
+        let a = src, b = tmp;
+        for (let p = 0; p < passes; p++) {
+            for (let j = 0; j < h; j++) {              // горизонтальный проход
+                const row = j * w;
+                for (let i = 0; i < w; i++) {
+                    let sum = 0, n = 0;
+                    const i0 = Math.max(0, i - radius), i1 = Math.min(w - 1, i + radius);
+                    for (let k = i0; k <= i1; k++) { sum += a[row + k]; n++; }
+                    b[row + i] = sum / n;
+                }
+            }
+            for (let i = 0; i < w; i++) {              // вертикальный проход
+                for (let j = 0; j < h; j++) {
+                    let sum = 0, n = 0;
+                    const j0 = Math.max(0, j - radius), j1 = Math.min(h - 1, j + radius);
+                    for (let k = j0; k <= j1; k++) { sum += b[k * w + i]; n++; }
+                    a[j * w + i] = sum / n;
+                }
+            }
+        }
+        return a;
+    },
     buildField(regions, voronoi, isWater, t) {
         const cell = this.biomeField.cell;
         const w = this.biomeField.w = Math.ceil(this.width / cell) + 1;
         const h = this.biomeField.h = Math.ceil(this.height / cell) + 1;
         const dom = this.biomeField.dom = new Uint8Array(w * h);
         const regionOf = this.biomeField.regionOf = new Int16Array(w * h).fill(-1);
+        const water = this.biomeField.water = new Uint8Array(w * h);
+        const cellElev = this.biomeField.cellElev = new Float32Array(w * h);
 
         // растеризация принадлежности ячеек регионам по их полигонам
         regions.forEach((region, idx) => {
@@ -1208,6 +1276,8 @@ const MapBiomes = {
                     regionOf[k] = ri;
                 }
                 dom[k] = this.biomes.classifyCell(i * cell, j * cell, t[ri], isWater[ri]);
+                water[k] = isWater[ri] ? 1 : 0;
+                cellElev[k] = t[ri];
             }
         }
         this.biomes.buildFieldCanvas();
@@ -1289,6 +1359,18 @@ const MapBiomes = {
         const region = this.terrain.regions.all[f.regionOf[j * f.w + i]];
         return region ? region.biomeMix : null;
     },
+    // Непрерывная маска суши 0..1 (размытая вода) — база плавного берега.
+    buildLandCover() {
+        const f = this.biomeField;
+        if (!f.water) { f.landCover = null; return null; }
+        const n = f.w * f.h;
+        if (!f.blurTmp || f.blurTmp.length !== n) f.blurTmp = new Float32Array(n);
+        const land = new Float32Array(n);
+        for (let k = 0; k < n; k++) land[k] = f.water[k] ? 0 : 1;
+        const r = Math.max(1, Math.round(this.landscape.feather * 2));
+        f.landCover = MapBiomes._blurField(land, f.w, f.h, r, 2, f.blurTmp);
+        return f.landCover;
+    },
     buildFieldCanvas() {
         const f = this.biomeField;
         if (!f.dom) return null;
@@ -1311,6 +1393,225 @@ const MapBiomes = {
         ctx.globalAlpha = alpha;
         ctx.drawImage(f.canvas, 0, 0, this.width, this.height);
         ctx.restore();
+    },
+};
+
+// ═══════════════════════════════════════════════════════════
+// SECTION: MAP_LANDSCAPE
+// Пиксельный ландшафт — основная графика карты (dark fantasy pixel
+// art). Рисуется напрямую из биомного поля: каждый пиксель фона берёт
+// биом из шума, а на границах биомов дизерится между двумя палитрами,
+// поэтому переходы плавные, без ступенек по полигонам регионов.
+// Вода/суша разграничиваются мягкой маской landCover (плавный берег).
+// Готовый слой кэшируется и пересобирается только при смене сезона/вида.
+// ═══════════════════════════════════════════════════════════
+const MapLandscape = {
+    data: {
+        // Палитры: 4 оттенка на биом (тёмный → светлый). Вода — глубокие
+        // сине-серые тона, лес — почти чёрно-зелёный, пики — камень.
+        palettes: {
+            DEEP_OCEAN:   ['#0d151d', '#101a24', '#132130', '#17283a'],
+            OCEAN:        ['#14222d', '#182a37', '#1d3342', '#233e4e'],
+            COAST:        ['#3c4b30', '#46573a', '#516444', '#5d714e'],
+            BEACH:        ['#7a6f4c', '#8d8058', '#a09266', '#b3a475'],
+            STEPPE:       ['#736d38', '#827b40', '#918949', '#a19752'],
+            PLAINS:       ['#4c6430', '#577137', '#637f3e', '#708d46'],
+            GRASSLAND:    ['#435c2b', '#4e6a31', '#5a7837', '#66863e'],
+            WETLANDS:     ['#2e4025', '#364a2c', '#3f5633', '#49623b'],
+            WOODLAND:     ['#2c4322', '#344d28', '#3d592e', '#476535'],
+            FOREST:       ['#1e3519', '#243f1e', '#2b4a24', '#33552b'],
+            DENSE_FOREST: ['#142512', '#192e16', '#1f371b', '#264120'],
+            HIGHLANDS:    ['#494941', '#535349', '#5e5e53', '#6a6a5e'],
+            PEAKS:        ['#4a4a50', '#56565d', '#63636b', '#71717a'],
+        },
+        // Тёплый/холодный сдвиг палитры по климату региона.
+        climateShift: {
+            cold:      { tint: '#b9d3e8', amt: 0.16 },
+            temperate: { tint: null, amt: 0 },
+            hot:       { tint: '#e8c07a', amt: 0.14 },
+        },
+        // Фактура биома: пятна/крапины поверх базового тона, чтобы лес
+        // читался как кроны, луга — как трава, степь — как пшеница и т.д.
+        // clump/clumpP — крупные пятна, hi/lo — мелкая крапина.
+        features: {
+            COAST:        { clump: 3, clumpP: 0.25, clumpCol: '#2f4023', hi: '#6b8055', hiP: 0.22, lo: '#26361d', loP: 0.18 },
+            BEACH:        { clump: 4, clumpP: 0.20, clumpCol: '#8a7d56', hi: '#c8b98a', hiP: 0.28, lo: '#6a6040', loP: 0.16 },
+            STEPPE:       { clump: 3, clumpP: 0.22, clumpCol: '#5a542c', hi: '#b8ac6a', hiP: 0.30, lo: '#544e28', loP: 0.18 },
+            PLAINS:       { clump: 3, clumpP: 0.24, clumpCol: '#3a4d24', hi: '#7f9d52', hiP: 0.24, lo: '#334420', loP: 0.18 },
+            GRASSLAND:    { clump: 3, clumpP: 0.26, clumpCol: '#354820', hi: '#83a856', hiP: 0.26, lo: '#2e3f1c', loP: 0.18 },
+            WETLANDS:     { clump: 3, clumpP: 0.34, clumpCol: '#22301a', hi: '#48603a', hiP: 0.18, lo: '#1b2715', loP: 0.24 },
+            WOODLAND:     { clump: 2, clumpP: 0.34, clumpCol: '#1e2f16', hi: '#486836', hiP: 0.20, lo: '#162411', loP: 0.22 },
+            FOREST:       { clump: 2, clumpP: 0.42, clumpCol: '#0f2010', hi: '#38682c', hiP: 0.18, lo: '#0c190d', loP: 0.24 },
+            DENSE_FOREST: { clump: 2, clumpP: 0.50, clumpCol: '#0a140b', hi: '#2c5623', hiP: 0.14, lo: '#081009', loP: 0.26 },
+            HIGHLANDS:    { clump: 2, clumpP: 0.30, clumpCol: '#38382f', hi: '#7d7d70', hiP: 0.26, lo: '#31312a', loP: 0.22 },
+            PEAKS:        { clump: 2, clumpP: 0.28, clumpCol: '#35353a', hi: '#d8dce0', hiP: 0.20, lo: '#2d2d31', loP: 0.22 },
+        },
+    },
+
+    methods: {
+    _shift(hex, tint, amt) { return amt > 0 ? this.color.blend(hex, tint, amt) : hex; },
+    _hash(a, b) {
+        let h = (Math.imul(a + 1, 374761393) + Math.imul(b + 1, 668265263)) >>> 0;
+        h = Math.imul(h ^ (h >>> 13), 1274126177) >>> 0;
+        return ((h ^ (h >>> 16)) >>> 0) / 4294967296;
+    },
+    // Оценки «пригодности» каждого биома для каждой ячейки поля (до argmax),
+    // затем каждое поле размывается. Так веса биомов меняются в пространстве
+    // непрерывно, а не скачком на границе региона → плавные переходы.
+    buildSoftBiome() {
+        const f = this.biomeField;
+        const w = f.w, h = f.h, n = w * h;
+        const defs = this.biomeTypeDefs, nb = defs.length;
+        const scores = f.softBiome = new Float32Array(nb * n);
+        const cellElev = f.cellElev;
+        for (let j = 0; j < h; j++) {
+            const y = j * f.cell;
+            const lat = Math.abs(y / this.height - 0.5) * 2;
+            for (let i = 0; i < w; i++) {
+                const k = j * w + i;
+                const tval = cellElev ? cellElev[k] : 0;
+                const x = i * f.cell;
+                for (let b = 0; b < nb; b++) {
+                    const def = defs[b];
+                    if (def.isWater) continue;
+                    const ns = def.noise;
+                    const v = this.biomes._fbm(x / this.width * ns.freq, y / this.height * ns.freq, def.seedOffset, ns.octaves);
+                    const latFit = Math.max(0, 1 - Math.abs(lat - def.lat) / def.latTol);
+                    const elevFit = Math.max(0, 1 - Math.abs(tval - def.elev) / def.elevTol);
+                    scores[b * n + k] = ns.weight * v * (0.10 + latFit) * (0.05 + elevFit);
+                }
+            }
+        }
+        // Размытие каждого биомного поля сглаживает границы между биомами.
+        const r = Math.max(1, Math.round(this.landscape.feather * 2));
+        const tmp = new Float32Array(n);
+        for (let b = 0; b < nb; b++) {
+            if (defs[b].isWater) continue;
+            const sub = scores.subarray(b * n, b * n + n);
+            MapBiomes._blurField(sub, w, h, r, 2, tmp);
+        }
+        return scores;
+    },
+    // Биом ячейки по мягким весам с дизерингом между двумя лидерами.
+    _biomeAt(fk, seed) {
+        const f = this.biomeField, sb = f.softBiome;
+        if (!sb) return null;
+        const defs = this.biomeTypeDefs, nb = defs.length, n = f.w * f.h;
+        let aB = -1, aS = 0, bB = -1, bS = 0;
+        for (let b = 0; b < nb; b++) {
+            if (defs[b].isWater) continue;
+            const s = sb[b * n + fk];
+            if (s <= 0) continue;
+            if (s > aS) { bB = aB; bS = aS; aB = b; aS = s; }
+            else if (s > bS) { bB = b; bS = s; }
+        }
+        if (aB < 0) return null;
+        const tot = aS + bS;
+        const pa = tot > 0 ? aS / tot : 1;
+        const pick = this.landscape._hash(seed, 911) < pa ? aB : (bB >= 0 ? bB : aB);
+        return defs[pick].id;
+    },
+    // Билинейная выборка мягкой маски суши → плавный берег без ступеньки.
+    _sampleCover(wx, wy) {
+        const f = this.biomeField, lc = f.landCover;
+        if (!lc) return (f.water && f.water[0] === 1) ? 0 : 1;
+        const gx = wx / f.cell - 0.5, gy = wy / f.cell - 0.5;
+        const x0 = Math.floor(gx), y0 = Math.floor(gy);
+        const fx = gx - x0, fy = gy - y0;
+        const cx = v => Math.max(0, Math.min(f.w - 1, v));
+        const cy = v => Math.max(0, Math.min(f.h - 1, v));
+        const x0c = cx(x0), x1c = cx(x0 + 1), y0c = cy(y0), y1c = cy(y0 + 1);
+        const c00 = lc[y0c * f.w + x0c], c10 = lc[y0c * f.w + x1c];
+        const c01 = lc[y1c * f.w + x0c], c11 = lc[y1c * f.w + x1c];
+        return (c00 * (1 - fx) + c10 * fx) * (1 - fy) + (c01 * (1 - fx) + c11 * fx) * fy;
+    },
+    // Цвет пикселя: дизеринг вода/суша по мягкой маске + биом по мягким весам.
+    pixelColor(fk, i, j, climate, season, cover) {
+        const L = this.landscape;
+        const shift = L.climateShift[climate] || L.climateShift.temperate;
+        const seasonTint = this.seasons[season]?.tints?.land?.[climate];
+        const seed = (i * 73856093) ^ (j * 19349663);
+        const useWater = L._hash(seed, 555) > cover;
+        let pal, id;
+        if (useWater) {
+            if (this.biomeField.water && this.biomeField.water[fk] === 1) {
+                id = this.biomeTypeIds[this.biomeField.dom[fk]];
+                pal = L.palettes[id] || L.palettes.OCEAN;
+            } else {
+                id = 'OCEAN'; pal = L.palettes.OCEAN;   // мелководье у берега
+            }
+        } else {
+            id = L._biomeAt(fk, seed) || this.biomeTypeIds[this.biomeField.dom[fk]];
+            pal = L.palettes[id];
+            if (!pal) return this.biomeColorById[id] || '#000000';
+        }
+        const shade = (L._hash(seed, 7) * pal.length) | 0;
+        let col = pal[shade] || pal[0];
+        if (!useWater) {
+            if (shift.amt > 0) col = L._shift(col, shift.tint, shift.amt);
+            if (seasonTint && seasonTint.strength > 0) col = this.color.blend(col, seasonTint.color, seasonTint.strength * 0.5);
+            // Фактура биома: крупные пятна (кроны/заросли) + мелкая крапина.
+            const feat = L.features[id];
+            if (feat) {
+                const clumpSeed = (i >> 1) * 40503 ^ (j >> 1) * 2246822519;
+                if (L._hash(clumpSeed, 31) < feat.clumpP) col = L._shift(col, feat.clumpCol, 0.7);
+                else if (L._hash(seed, 53) < feat.hiP) col = L._shift(col, feat.hi, 0.55);
+                else if (L._hash(seed, 71) < feat.loP) col = L._shift(col, feat.lo, 0.55);
+            }
+        }
+        return col;
+    },
+    // Сборка фонового слоя (ImageData на весь мир, шаг = landscape.pixel).
+    build() {
+        const f = this.biomeField;
+        const L = this.landscape;
+        if (!f.dom || !f.regionOf) { L.canvas = null; return null; }
+        const px = Math.max(1, L.pixel);
+        const w = L.w = Math.max(1, Math.ceil(this.width / px));
+        const h = L.h = Math.max(1, Math.ceil(this.height / px));
+        const season = this.currentSeason;
+        const c = document.createElement('canvas'); c.width = w; c.height = h;
+        const g = c.getContext('2d');
+        const img = g.createImageData(w, h);
+        const data = img.data;
+
+        for (let j = 0; j < h; j++) {
+            const wy = j * px;
+            for (let i = 0; i < w; i++) {
+                const k = j * w + i;
+                const wx = i * px;
+                // биом/климат — с грубой сетки поля (быстро), суша — по маске
+                const fi = Math.min(f.w - 1, (wx / f.cell) | 0);
+                const fj = Math.min(f.h - 1, (wy / f.cell) | 0);
+                const fk = fj * f.w + fi;
+                const ri = f.regionOf[fk];
+                const region = ri >= 0 ? this.terrain.regions.all[ri] : null;
+                const cover = L._sampleCover(wx, wy);
+                const climate = region?.climateZone || 'temperate';
+                const col = L.pixelColor(fk, i, j, climate, season, cover);
+                const rgb = this.color.hexToRgb(col);
+                const o = k * 4;
+                data[o] = rgb.r; data[o + 1] = rgb.g; data[o + 2] = rgb.b; data[o + 3] = 255;
+            }
+        }
+        g.putImageData(img, 0, 0);
+        L.canvas = c;
+        L.tintKey = season;
+        return c;
+    },
+    ensure() {
+        const L = this.landscape;
+        if (!L.canvas || L.tintKey !== this.currentSeason) L.build();
+        return L.canvas;
+    },
+    paint(ctx) {
+        const c = this.landscape.ensure();
+        if (!c) return;
+        ctx.save();
+        ctx.imageSmoothingEnabled = false;
+        ctx.drawImage(c, 0, 0, this.width, this.height);
+        ctx.restore();
+    },
     },
 };
 
@@ -1847,31 +2148,42 @@ const MapFaction = {
 }
 
 const MapTerrain = {
+    // Режимы, где регион заливается сплошным цветом (карта фракций, ресурсы,
+    // культура). В обычном обзоре и «рельеф+фракции» фоном служит пиксельный
+    // биомный ландшафт, поэтому плоская заливка не нужна.
+    usesFlatFill() {
+        return this.viewMode === 'factions' || this.viewMode === 'culture' ||
+            ['food', 'gold', 'production', 'manpower', 'ether'].includes(this.viewMode);
+    },
     renderRegions(ctx, visibleRect = null) {
         const resourceRange = ['food', 'gold', 'production', 'manpower', 'ether'].includes(this.viewMode)
         ? this.color.getResourceRange(this.viewMode)
         : null;
+        const flatFill = this.terrain.usesFlatFill();
 
         for (let i = 0; i < this.terrain.regions.all.length; i++) {
             const polygon = this.mapVoronoi.cellPolygon(i);
             if (!polygon) continue;
-            
+
             const region = this.terrain.regions.all[i];
 
             if (visibleRect && !this.bboxIntersects(region.bbox, visibleRect)) continue;
-            const color = this.color.getBase(region, resourceRange);
-            ctx.fillStyle = color;
-            ctx.strokeStyle = color;
-            ctx.lineWidth = 0.05;
 
-            this.drawRegionPath(ctx, polygon);
-            ctx.fill();
-            ctx.stroke();
+            if (flatFill) {
+                const color = this.color.getBase(region, resourceRange);
+                ctx.fillStyle = color;
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 0.05;
+                this.drawRegionPath(ctx, polygon);
+                ctx.fill();
+                ctx.stroke();
+            }
 
             if (region.ownerId !== null && region.ownerId !== undefined && this.factions.list?.[region.ownerId] && this.factions.isDiscovered(region.ownerId)) {
                 ctx.save();
                 ctx.globalAlpha = this.viewMode === 'factions' ? 0.65 : (this.viewMode === 'political') ? 0.42 : 0;
                 ctx.fillStyle = this.factions.list[region.ownerId].color;
+                this.drawRegionPath(ctx, polygon);
                 ctx.fill();
                 ctx.restore();
             }
