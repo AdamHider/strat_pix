@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Генератор карты</title>
+<style>
+    :root { --bg: #f1eee6; --fg: #232a2e; --muted: #66706f; --panel: #e2ddd0; --accent: #a8641c; --accent-fg: #fff; }
+    @media (prefers-color-scheme: dark) {
+        :root { --bg: #141b21; --fg: #dde4dc; --muted: #8b9997; --panel: #202b33; --accent: #e0b354; --accent-fg: #1a1408; }
+    }
+    body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.5 "Trebuchet MS", Verdana, sans-serif; }
+    main { max-width: 1100px; margin: 0 auto; padding: 16px; }
+    h1 { font: 700 22px/1.2 Georgia, "Times New Roman", serif; margin: 0 0 12px; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 12px; }
+    button, input[type=number] { font: inherit; color: var(--fg); background: var(--panel); border: 1px solid transparent; border-radius: 4px; padding: 6px 12px; }
+    button { cursor: pointer; }
+    button[aria-pressed=true], button.primary { background: var(--accent); color: var(--accent-fg); }
+    input[type=number] { width: 110px; }
+    label { color: var(--muted); display: flex; gap: 6px; align-items: center; }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    #map { display: block; width: 100%; height: 70vh; cursor: grab; touch-action: none; background: #0f1418; }
+    #map.dragging { cursor: grabbing; }
+    #info, .hint { margin: 8px 0 0; color: var(--muted); }
+    #info { min-height: 3em; }
+    .selection { white-space: pre-line; background: var(--panel); border-radius: 4px; padding: 8px 12px; margin-top: 8px; }
+</style>
+</head>
+<body>
+<main>
+    <h1>Генератор карты</h1>
+    <div class="controls">
+        <input id="seed" type="number" value="1" aria-label="Seed">
+        <button id="generate" class="primary">Новая карта</button>
+        <button data-view="terrain" aria-pressed="true">Рельеф</button>
+        <button data-view="temperature" aria-pressed="false">Температура</button>
+        <button data-view="regions" aria-pressed="false">Регионы</button>
+        <label><input type="checkbox" id="borders" checked>границы регионов</label>
+        <button id="fit">Вся карта</button>
+        <button id="demo-objects" aria-pressed="false">Объекты (пример)</button>
+    </div>
+    <div class="controls" role="group" aria-label="Сезон">
+        <button data-season="spring" aria-pressed="false">Весна</button>
+        <button data-season="summer" aria-pressed="true">Лето</button>
+        <button data-season="autumn" aria-pressed="false">Осень</button>
+        <button data-season="winter" aria-pressed="false">Зима</button>
+        <button id="mood" aria-pressed="true">Тёмный стиль</button>
+        <button id="settlements" aria-pressed="true">Поселения</button>
+    </div>
+    <canvas id="map" tabindex="0" aria-label="Карта мира"></canvas>
+    <p class="hint">Перетаскивайте карту мышью, колесо — зум. С клавиатуры (когда карта в фокусе): стрелки или WASD — движение, +/− — зум. Клик — выделить клетку и её регион (Esc — снять выделение).</p>
+    <p id="info"></p>
+    <div id="selection" class="selection" hidden></div>
+</main>
+
+<script src="map-generator.js"></script>
+<script src="seasons.js"></script>
+<script src="map-painter.js"></script>
+<script src="sprite-renderer.js"></script>
+<script src="sprite-examples.js"></script>
+<script src="map-renderer.js"></script>
+<script src="main.js"></script>
+</body>
+</html>
